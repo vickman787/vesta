@@ -1,0 +1,19 @@
+node_modules/
+.next/
+dist/
+build/
+.claude/
+.env
+.env.local
+*.tsbuildinfo
+npm-debug.log*
+opencode.json
+
+# Transient esbuild output from `genlayer deploy`
+deploy/*.compiled.js
+
+# Python contract tooling
+.venv/
+__pycache__/
+.pytest_cache/
+artifacts/
