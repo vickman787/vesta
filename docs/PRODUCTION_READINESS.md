@@ -1,0 +1,95 @@
+# Production Readiness Checklist
+
+GenLayer mainnet is not live — `genlayer-js` rejects `mainnet` as a network — so
+this project runs on **Studionet**. This checklist therefore covers what has been
+demonstrated on Studio, and the additional work that would be required before
+real funds, on any network, are placed under this contract's control.
+
+Studio state is temporary and gasless, so none of what works there is production
+evidence. Everything below that matters for real funds is unverified.
+
+## Product And Evidence
+
+- [x] The Intelligent Contract is implemented and passes `genvm-lint check`.
+- [x] Direct-mode tests cover adjudication, every deterministic override,
+      settlement authorization, expiry, pause, window accounting, human review,
+      access control, and validator agreement and disagreement.
+- [x] Contract deployed on Studionet (`0x9Bda595e6cB407eD45A42bB42bcb507423B16355`),
+      with owner and agent as separate accounts.
+- [x] End-to-end happy path demonstrated on Studio: funding, an adjudicated
+      approval by real validators, and a settled payment with the treasury
+      debited.
+- [ ] `POLICY_OVERRIDE` rejection of a model-approved request, demonstrated live.
+- [ ] Settlement refused after a post-approval policy change, demonstrated live.
+- [ ] Pause/resume cycle, demonstrated live.
+- [ ] Integration tests pass against a live network (`npm run test:integration`).
+- [ ] Hosted demo and repository URLs are verified, or marked unavailable.
+
+## Testing And Security
+
+- [ ] Reproducible install, linter, direct-mode suite, `tsc`, and production
+      build all pass at the release revision.
+- [ ] Adversarial prompt-injection cases are tested against a real model, not
+      only against a mock. Direct-mode tests prove the deterministic override
+      holds; they do not prove the model resists manipulation.
+- [ ] Consensus behaviour is measured on a live network: how often validators
+      disagree on borderline requests, and what fraction of transactions end
+      undetermined.
+- [ ] Risk-score tolerance and the confidence floor are tuned against observed
+      model behaviour rather than assumed.
+- [ ] Dependency review and tracked-secret scan are clean.
+- [ ] Independent audit status is stated accurately. No audit has been performed;
+      until one has, treasury value and limits stay small and no audit claim is
+      made.
+- [ ] Threat model covers owner-key, agent-key, validator, RPC, frontend, and
+      merchant compromise.
+
+## Contract Design Review
+
+- [ ] The duplicate-detection scan window (last 50 requests) is reviewed against
+      expected request volume. A high-volume treasury can push an equivalent
+      request out of scan range.
+- [ ] Unbounded growth of `request_ids` is reviewed against expected lifetime
+      volume and storage cost.
+- [ ] The `on='finalized'` timing of merchant transfers is acceptable to the
+      merchants being onboarded.
+- [ ] Upgradability posture is decided explicitly: this contract has no upgrade
+      path, so a fix means a new deployment and a treasury migration.
+
+## Configuration And Ownership
+
+- [ ] The owner account is not the authorized agent.
+- [ ] Owner and agent keys are separate, protected, and rotatable.
+- [ ] Neither key is ever exposed to a prompt, a log, or the browser.
+- [ ] Limits and the initial treasury balance are reviewed as concrete values.
+- [ ] Deployment records for each network are kept separately and are not
+      overwritten.
+
+## Operations
+
+- [ ] Gas usage is measured from real receipts, including the cost of an
+      `submit_request` with its LLM calls.
+- [ ] Monitoring covers treasury balance, settlements, rejections, undetermined
+      transactions, pauses, policy changes, and agent rotation.
+- [ ] A pause operator and an escalation path are assigned.
+- [ ] Initial validation uses minimal value and conservative limits.
+
+## Approval And Broadcast
+
+- [ ] The owner reviews the exact network, command, signer, contract revision,
+      and constructor arguments before any key is unlocked.
+- [ ] The owner explicitly approves each key-use batch. Deployment approval is
+      not blanket authorization for funding and configuration.
+- [ ] The deploy receipt is confirmed accepted, and the execution result checked,
+      before funding.
+- [ ] Explorer links are published only after receipts are verified.
+
+## Exit Criteria
+
+- [ ] Approved and rejected scenarios behave as expected on the target network
+      with minimal value at risk.
+- [ ] The owner can pause, rotate the agent, and withdraw under the contract's
+      rules.
+- [ ] Public documentation names real deployed addresses and does not overstate
+      audit, availability, or consensus behaviour.
+- [ ] A post-launch review is scheduled before limits or treasury value rise.
