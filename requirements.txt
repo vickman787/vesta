@@ -1,0 +1,10 @@
+# Contract tooling for the Guardian Intelligent Contract.
+#
+#   python -m venv .venv
+#   .venv/Scripts/activate      (Windows)   or   source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# genlayer-test brings pytest and the direct-mode runner; genvm-linter brings
+# the static safety checks and schema extraction.
+genlayer-test==0.29.2
+genvm-linter==0.11.0
