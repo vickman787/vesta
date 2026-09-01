@@ -1,0 +1,25 @@
+# Test network configuration for `gltest` integration runs.
+#
+# The app and the deployed contract live on Studionet. These entries only affect
+# `gltest`, which deploys its own throwaway contract and drives it over RPC.
+#
+# Direct-mode tests (`npm test`) use none of this — they run the contract
+# in-process with mocked LLM replies.
+#
+# studionet is the default so integration tests hit the same network the app uses.
+# localnet is available for a faster loop if you run a local simulator:
+#
+#   .venv/Scripts/glsim.exe --port 4000 --validators 3 --no-browser
+#   gltest tests/integration -v -s --network localnet
+networks:
+  default: studionet
+
+  localnet:
+    url: http://127.0.0.1:4000/api
+
+  studionet:
+    url: https://studio.genlayer.com/api
+
+paths:
+  contracts: contracts
+  artifacts: artifacts
