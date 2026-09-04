@@ -32,9 +32,12 @@ const EMPTY_CONFIG: TreasuryConfig = {
   remainingHourlyBudget: 0n,
   balance: 0n,
   totalPaid: 0n,
+  pendingTotal: 0n,
   paused: false,
   requestCount: 0,
 };
+
+const DIGEST_REF = 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08';
 
 const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 
@@ -66,16 +69,19 @@ export default function Dashboard() {
     'Rent inference capacity for the customer support evaluation run',
   );
   const [evidence, setEvidence] = useState(
-    'Vendor quote verified; workload ticket OPS-204; expected completion within 30 minutes',
+    `ticket=OPS-204; quote=Q-8821; vendor=acme-compute; digest=${DIGEST_REF}`,
   );
   const [agentDraft, setAgentDraft] = useState('');
   const [perTxDraft, setPerTxDraft] = useState('0.01');
   const [hourlyDraft, setHourlyDraft] = useState('0.05');
   const [reviewReason, setReviewReason] = useState('');
+  const [deliveryRef, setDeliveryRef] = useState(`delivery=invoice INV-8821; digest=${DIGEST_REF}`);
+  const [settlementRef, setSettlementRef] = useState('0x' + 'a'.repeat(64));
 
   const selected = requests.find((item) => item.requestId === selectedId) ?? requests[0] ?? null;
   const isOwner = sameAddress(account, treasury.owner);
   const isAgent = sameAddress(account, treasury.authorizedAgent);
+  const isMerchant = Boolean(selected && sameAddress(account, selected.merchant));
   const online = contractState === 'online';
 
   const note = useCallback((text: string, bad = false, hash?: string) => {
@@ -163,7 +169,12 @@ export default function Dashboard() {
     note('Wallet disconnected.');
   }
 
-  /** Run a contract write, then refresh state from the contract. */
+  /**
+   * Run a contract write and refresh state only once the transaction has
+   * FINALIZED with a successful execution. Nothing is reported as done at
+   * acceptance: `write` waits for finalization and re-checks the execution
+   * result before returning.
+   */
   async function send(label: string, functionName: string, args: unknown[], value = 0n) {
     if (!account) {
       note('Connect a wallet first.', true);
@@ -178,7 +189,7 @@ export default function Dashboard() {
       const client = writeClient(account as `0x${string}`);
       note(`${label}: submitted to consensus...`);
       const outcome = await write(client, contractAddress, functionName, args, value);
-      note(`${label}: accepted`, false, outcome.hash);
+      note(`${label}: finalized and confirmed on-chain`, false, outcome.hash);
       await loadTreasury();
       return true;
     } catch (error) {
@@ -187,6 +198,32 @@ export default function Dashboard() {
     } finally {
       setBusy('');
     }
+  }
+
+  async function confirmDelivery() {
+    if (!selected) return;
+    const ok = await send('Delivery confirmation', 'confirm_delivery', [
+      selected.requestId,
+      deliveryRef.trim(),
+    ]);
+    if (ok) setSelectedId(selected.requestId);
+  }
+
+  async function finalizePayment() {
+    if (!selected) return;
+    const ok = await send('Settlement finalization', 'finalize_payment', [
+      selected.requestId,
+      settlementRef.trim(),
+    ]);
+    if (ok) setSelectedId(selected.requestId);
+  }
+
+  async function unwindPayment() {
+    if (!selected) return;
+    const ok = await send('Pending payment unwind', 'resolve_pending_payment', [
+      selected.requestId,
+    ]);
+    if (ok) setSelectedId(selected.requestId);
   }
 
   async function submitRequest() {
@@ -597,6 +634,19 @@ export default function Dashboard() {
                   <strong>{short(selected.submittedBy)}</strong>
                   <span>Expires</span>
                   <strong>{new Date(selected.expiresAt * 1000).toLocaleString()}</strong>
+                  {selected.deliveryConfirmedBy &&
+                    sameAddress(selected.deliveryConfirmedBy, selected.merchant) && (
+                      <>
+                        <span>Delivery confirmed</span>
+                        <strong>{short(selected.deliveryConfirmedBy)}</strong>
+                      </>
+                    )}
+                  {selected.settlementReference && (
+                    <>
+                      <span>Settlement ref</span>
+                      <strong>{short(selected.settlementReference)}</strong>
+                    </>
+                  )}
                   {selected.paidAt && (
                     <>
                       <span>Paid</span>
@@ -639,16 +689,113 @@ export default function Dashboard() {
 
                 {selected.status === 'APPROVED' && (
                   <>
-                    <button
-                      className="action-wide"
-                      disabled={(!isAgent && !isOwner) || Boolean(busy)}
-                      onClick={() => void send('Payment', 'execute_payment', [selected.requestId])}
-                    >
-                      {isAgent ? 'Execute as agent' : 'Execute as owner'}
-                    </button>
-                    {!isAgent && !isOwner && (
+                    {isMerchant && (
+                      <>
+                        <label>
+                          Delivery reference
+                          <textarea
+                            value={deliveryRef}
+                            onChange={(event) => setDeliveryRef(event.target.value)}
+                            placeholder="Attach the verifiable deliverable, e.g. delivery=invoice INV-8821"
+                          />
+                        </label>
+                        <button
+                          className="action-wide muted"
+                          disabled={!isMerchant || Boolean(busy)}
+                          onClick={confirmDelivery}
+                        >
+                          Confirm delivery (merchant)
+                        </button>
+                        {!isOwner && !isAgent && (
+                          <p className="hint">
+                            Confirming delivery is what releases the authorized agent to execute this payment.
+                          </p>
+                        )}
+                      </>
+                    )}
+                    {selected.deliveryConfirmedBy &&
+                      sameAddress(selected.deliveryConfirmedBy, selected.merchant) && (
+                        <button
+                          className="action-wide"
+                          disabled={!isAgent || Boolean(busy)}
+                          onClick={() =>
+                            void send('Payment authorization', 'execute_payment', [
+                              selected.requestId,
+                            ])
+                          }
+                        >
+                          Execute payment (agent)
+                        </button>
+                      )}
+                    {isAgent &&
+                      !(
+                        selected.deliveryConfirmedBy &&
+                        sameAddress(selected.deliveryConfirmedBy, selected.merchant)
+                      ) && (
+                        <p className="hint warn">
+                          Delivery is not yet confirmed by the merchant, so the agent cannot execute.
+                          An approved narrative alone does not authorize a payment.
+                        </p>
+                      )}
+                    {isOwner && (
+                      <button
+                        className="action-wide"
+                        disabled={!isOwner || Boolean(busy)}
+                        onClick={() =>
+                          void send('Payment authorization', 'execute_payment', [
+                            selected.requestId,
+                          ])
+                        }
+                      >
+                        Execute as owner (override)
+                      </button>
+                    )}
+                    {!isOwner && !isAgent && !isMerchant && (
                       <p className="hint warn">
-                        Connect the authorized agent or the owner to settle this payment.
+                        Connect the authorized agent, the merchant, or the owner to move this request forward.
+                      </p>
+                    )}
+                  </>
+                )}
+
+                {selected.status === 'PAYMENT_PENDING' && (
+                  <>
+                    <p className="hint warn">
+                      Payment is authorized and the transfer is settling on the chain layer — it is
+                      not yet reported as paid. The hourly-window debit is reserved. Finalize once the
+                      transfer is finalized, or unwind it if the transfer failed.
+                    </p>
+                    {(isMerchant || isOwner) && (
+                      <>
+                        <label>
+                          Settlement reference (finalized transfer id)
+                          <input
+                            value={settlementRef}
+                            onChange={(event) => setSettlementRef(event.target.value)}
+                            placeholder="0x..."
+                          />
+                        </label>
+                        <div className="grid grid-cols-2 gap-3">
+                          <button
+                            className="action-wide"
+                            disabled={Boolean(busy)}
+                            onClick={finalizePayment}
+                          >
+                            Finalize settlement
+                          </button>
+                          <button
+                            className="action-wide danger"
+                            disabled={Boolean(busy)}
+                            onClick={unwindPayment}
+                          >
+                            Mark transfer failed
+                          </button>
+                        </div>
+                      </>
+                    )}
+                    {!isMerchant && !isOwner && (
+                      <p className="hint warn">
+                        Connect the merchant of record or the owner to finalize or unwind this payment.
                       </p>
                     )}
                   </>
@@ -674,7 +821,9 @@ export default function Dashboard() {
                 </strong>
                 <span>Remaining</span>
                 <strong>{gen(treasury.remainingHourlyBudget)} GEN</strong>
-                <span>Total paid</span>
+                <span>In flight (pending)</span>
+                <strong>{gen(treasury.pendingTotal)} GEN</strong>
+                <span>Total paid (finalized)</span>
                 <strong>{gen(treasury.totalPaid)} GEN</strong>
               </div>
             </Panel>
@@ -713,6 +862,8 @@ export default function Dashboard() {
                 <li>Submit an amount over the per-transaction limit</li>
                 <li>Repeat an identical merchant, amount, and purpose</li>
                 <li>Submit for a merchant that is not allowlisted</li>
+                <li>Submit narrative-only evidence with no verifiable artifact</li>
+                <li>Try to execute as the agent before the merchant confirms delivery</li>
                 <li>Approve a request, de-allowlist the merchant, then execute it</li>
                 <li>Pause the treasury, then execute an approved request</li>
                 <li>Submit evidence containing instruction-like text</li>
