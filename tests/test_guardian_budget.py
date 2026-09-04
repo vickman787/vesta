@@ -1,13 +1,18 @@
 """Direct-mode tests for the GuardianBudget Intelligent Contract.
 
 These run the contract in-process with mocked LLM replies. They cover the
-deterministic policy, the decision plumbing, and the validator comparison
-logic. Real multi-validator consensus is only exercised on a live network.
+deterministic policy, the decision plumbing, the validator comparison logic
+(decision, risk score, and confidence), delivery confirmation, and the
+finality-safe payment lifecycle. Real multi-validator consensus is only
+exercised on a live network.
 
 Note on balances: direct mode tracks `self.balance` through `vm.deal`, but an
 `emit_transfer` does not debit it — the message is recorded rather than settled.
-Assertions here therefore check the contract's own accounting (`total_paid`,
-`spend_in_window`) rather than the raw balance after a payment.
+Finalizing a payment therefore models the chain-layer debit explicitly via
+`settle_chain`, so the treasury/merchant balance reconciliation the test asserts
+mirrors what the contract observes once the external transfer is finalized.
+Assertions otherwise check the contract's own accounting (`total_paid`,
+`pending_total`, `spend_in_window`) rather than the raw balance mid-flight.
 """
 
 import json
@@ -29,6 +34,14 @@ PER_TX = 10**16
 HOURLY = 5 * 10**16
 TREASURY = 10**18
 AMOUNT = 10**15
+
+# Evidence must anchor a purchase to an independently verifiable artifact for an
+# autonomous approval (see _evidence_has_reference in the contract).
+VERIFIABLE_EVIDENCE = (
+    "ticket=OPS-204; quote=Q-8821; vendor=acme-compute; "
+    "digest=sha256:"
+    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+)
 
 APPROVE = {
     "decision": "approve",
@@ -92,7 +105,7 @@ def submit(contract, request_id: str = "req-1", **overrides) -> dict:
         "merchant": address(MERCHANT),
         "amount": AMOUNT,
         "purpose": "Rent inference capacity for the support evaluation run",
-        "evidence": "Vendor quote verified; workload ticket OPS-204",
+        "evidence": VERIFIABLE_EVIDENCE,
         "expires_at": soon(),
     }
     payload.update(overrides)
@@ -114,6 +127,74 @@ def config(contract) -> dict:
 
 def request_record(contract, request_id: str = "req-1") -> dict:
     return json.loads(contract.get_request(request_id))
+
+
+def confirm_delivery(
+    vm,
+    contract,
+    request_id: str = "req-1",
+    reference: str = "delivery=invoice INV-8821; digest=sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+) -> None:
+    """The merchant of record attests the deliverable was completed."""
+    vm.sender = MERCHANT
+    contract.confirm_delivery(request_id, reference)
+
+
+def execute_as(vm, contract, request_id: str = "req-1", sender=AGENT) -> dict:
+    """Authorize settlement as `sender`; returns the JSON status document."""
+    vm.sender = sender
+    return json.loads(contract.execute_payment(request_id))
+
+
+def finalize_as(
+    vm,
+    contract,
+    request_id: str = "req-1",
+    reference: str = "0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    sender=MERCHANT,
+) -> dict:
+    """Confirm, once the external transfer is finalized, that the payment landed."""
+    vm.sender = sender
+    return json.loads(contract.finalize_payment(request_id, reference))
+
+
+def resolve_pending(vm, contract, request_id: str = "req-1", sender=MERCHANT) -> dict:
+    """Unwind a payment whose external transfer never settled."""
+    vm.sender = sender
+    return json.loads(contract.resolve_pending_payment(request_id))
+
+
+def approve_confirm_execute(vm, contract, request_id: str = "req-1") -> None:
+    """The canonical agent settlement path: approve, confirm, execute."""
+    confirm_delivery(vm, contract, request_id)
+    execute_as(vm, contract, request_id, sender=AGENT)
+
+
+def approve_confirm_execute_finalize(
+    vm, contract, request_id: str = "req-1"
+) -> dict:
+    """Run the whole lifecycle and return the finalized request record."""
+    approve_confirm_execute(vm, contract, request_id)
+    assert request_record(contract, request_id)["status"] == "PAYMENT_PENDING"
+    finalize_as(vm, contract, request_id)
+    return request_record(contract, request_id)
+
+
+def settle_chain(vm, contract_address, merchant, amount) -> None:
+    """Model the chain-layer debit once an emitted transfer is finalized.
+
+    Direct mode records an `emit_transfer` message rather than settling it, so
+    tests that reconcile treasury and merchant balances apply the debit and
+    credit here, the way the network does at finalization.
+    """
+    contract_addr = vm._to_bytes(contract_address)
+    merchant_addr = vm._to_bytes(merchant)
+    vm._balances[contract_addr] = vm._balances.get(contract_addr, 0) - amount
+    vm._balances[merchant_addr] = vm._balances.get(merchant_addr, 0) + amount
+
+
+def balance_of(vm, address_value) -> int:
+    return vm._balances.get(vm._to_bytes(address_value), 0)
 
 
 # ------------------------------------------------------------------ deployment
@@ -336,134 +417,190 @@ def test_agent_can_settle_an_approved_request(direct_vm, guardian):
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
 
-    direct_vm.sender = AGENT
-    guardian.execute_payment("req-1")
+    approve_confirm_execute_finalize(direct_vm, guardian)
 
+    record = request_record(guardian)
+    assert record["status"] == "PAID"
+    assert record["paidAt"] != ""
+    assert record["settlementReference"] != ""
+    assert record["deliveryConfirmedBy"].lower() == address(MERCHANT)
+
+    state = config(guardian)
+    assert state["totalPaid"] == str(AMOUNT)
+    assert state["pendingTotal"] == "0"
+    assert state["spendInWindow"] == str(AMOUNT)
+    assert state["remainingHourlyBudget"] == str(HOURLY - AMOUNT)
+
+
+def test_agent_execution_requires_a_delivery_confirmation(direct_vm, guardian):
+    """An approved narrative alone cannot trigger payment: the agent path is
+    bound to a delivery confirmation by the merchant of record."""
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+
+    with direct_vm.expect_revert("requires the merchant to confirm delivery"):
+        execute_as(direct_vm, guardian, sender=AGENT)
+
+    assert request_record(guardian)["status"] == "APPROVED"
+
+    # Confirming delivery must come from the merchant, not the requester/agent.
+    direct_vm.sender = AGENT
+    with direct_vm.expect_revert("only the merchant of record"):
+        guardian.confirm_delivery("req-1", "delivery=invoice INV-8821")
+
+    confirm_delivery(direct_vm, guardian)
+    assert (
+        request_record(guardian)["deliveryConfirmedBy"].lower()
+        == address(MERCHANT)
+    )
+
+
+def test_executing_marks_the_payment_pending_until_finalized(direct_vm, guardian):
+    """Delayed finality: `execute_payment` never reports a payment as paid.
+
+    The record sits in PAYMENT_PENDING with the window debit reserved until
+    `finalize_payment` confirms the settled external transfer.
+    """
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    approve_confirm_execute(direct_vm, guardian)
+
+    record = request_record(guardian)
+    assert record["status"] == "PAYMENT_PENDING"
+    assert record["paidAt"] == ""
+
+    state = config(guardian)
+    assert state["totalPaid"] == "0"
+    assert state["pendingTotal"] == str(AMOUNT)
+    assert state["spendInWindow"] == str(AMOUNT)
+    assert state["remainingHourlyBudget"] == str(HOURLY - AMOUNT)
+
+    finalize_as(direct_vm, guardian)
     record = request_record(guardian)
     assert record["status"] == "PAID"
     assert record["paidAt"] != ""
 
     state = config(guardian)
     assert state["totalPaid"] == str(AMOUNT)
+    assert state["pendingTotal"] == "0"
     assert state["spendInWindow"] == str(AMOUNT)
     assert state["remainingHourlyBudget"] == str(HOURLY - AMOUNT)
-
-
-def test_owner_can_settle_an_approved_request(direct_vm, guardian):
-    mock_verdict(direct_vm, APPROVE)
-    submit(guardian)
-
-    guardian.execute_payment("req-1")
-    assert request_record(guardian)["status"] == "PAID"
 
 
 def test_a_stranger_cannot_settle_a_request(direct_vm, guardian):
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
 
-    direct_vm.sender = STRANGER
     with direct_vm.expect_revert("only the authorized agent or the owner"):
-        guardian.execute_payment("req-1")
+        execute_as(direct_vm, guardian, sender=STRANGER)
 
 
 def test_a_request_cannot_be_settled_twice(direct_vm, guardian):
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
 
-    direct_vm.sender = AGENT
-    guardian.execute_payment("req-1")
+    approve_confirm_execute(direct_vm, guardian)
     with direct_vm.expect_revert("request is not in an approved state"):
-        guardian.execute_payment("req-1")
+        execute_as(direct_vm, guardian, sender=AGENT)
+
+    finalize_as(direct_vm, guardian)
+    with direct_vm.expect_revert("request is not in an approved state"):
+        execute_as(direct_vm, guardian, sender=AGENT)
 
 
 def test_unknown_request_cannot_be_settled(direct_vm, guardian):
-    direct_vm.sender = AGENT
     with direct_vm.expect_revert("request_id is not known"):
-        guardian.execute_payment("req-404")
+        execute_as(direct_vm, guardian, "req-404", sender=AGENT)
 
 
 def test_settlement_is_refused_after_the_request_expires(direct_vm, guardian):
     mock_verdict(direct_vm, APPROVE)
     submit(guardian, expires_at=now() + 120)
+    confirm_delivery(direct_vm, guardian)
 
     direct_vm.warp("2026-12-31T23:59:59+00:00")
-    direct_vm.sender = AGENT
     with direct_vm.expect_revert("request has expired"):
-        guardian.execute_payment("req-1")
+        execute_as(direct_vm, guardian, sender=AGENT)
 
 
 def test_settlement_is_refused_while_paused(direct_vm, guardian):
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
+    confirm_delivery(direct_vm, guardian)
 
+    direct_vm.sender = OWNER
     guardian.set_emergency_pause(True)
     assert config(guardian)["paused"] is True
 
-    direct_vm.sender = AGENT
     with direct_vm.expect_revert("treasury is paused"):
-        guardian.execute_payment("req-1")
+        execute_as(direct_vm, guardian, sender=AGENT)
 
 
 def test_settlement_resumes_after_the_pause_is_lifted(direct_vm, guardian):
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
+    confirm_delivery(direct_vm, guardian)
 
+    direct_vm.sender = OWNER
     guardian.set_emergency_pause(True)
     guardian.set_emergency_pause(False)
 
-    direct_vm.sender = AGENT
-    guardian.execute_payment("req-1")
-    assert request_record(guardian)["status"] == "PAID"
+    execute_as(direct_vm, guardian, sender=AGENT)
+    assert request_record(guardian)["status"] == "PAYMENT_PENDING"
 
 
 def test_settlement_is_refused_if_the_merchant_is_de_allowlisted_after_approval(direct_vm, guardian):
     """An approval is not a standing permission; the allowlist is re-read at settlement."""
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
+    confirm_delivery(direct_vm, guardian)
 
+    direct_vm.sender = OWNER
     guardian.set_merchant_allowed(address(MERCHANT), False)
 
-    direct_vm.sender = AGENT
     with direct_vm.expect_revert("merchant is not allowlisted"):
-        guardian.execute_payment("req-1")
+        execute_as(direct_vm, guardian, sender=AGENT)
 
 
 def test_settlement_is_refused_if_the_limit_is_lowered_after_approval(direct_vm, guardian):
     mock_verdict(direct_vm, APPROVE)
     submit(guardian, amount=PER_TX)
+    confirm_delivery(direct_vm, guardian)
 
+    direct_vm.sender = OWNER
     guardian.set_spending_limits(AMOUNT, HOURLY)
 
-    direct_vm.sender = AGENT
     with direct_vm.expect_revert("exceeds the per-transaction limit"):
-        guardian.execute_payment("req-1")
+        execute_as(direct_vm, guardian, sender=AGENT)
 
 
 def test_the_hourly_window_caps_total_settlement(direct_vm, guardian):
     """Five payments at the per-transaction limit exhaust the hourly budget.
 
     The sixth is approved at submission — the window still had room when it was
-    judged — and then refused at settlement, which is the check that matters.
+    judged — and then refused at settlement. Each authorize reserves its window
+    debit while PAYMENT_PENDING, so overscheduling within an hour is impossible
+    even before the external transfers finalize.
     """
     mock_verdict(direct_vm, APPROVE)
     for index in range(6):
         submit(guardian, f"req-{index}", amount=PER_TX, purpose=f"Scheduled batch {index}")
 
-    direct_vm.sender = AGENT
     for index in range(5):
-        guardian.execute_payment(f"req-{index}")
+        execute_as(direct_vm, guardian, f"req-{index}", sender=OWNER)
 
-    assert config(guardian)["remainingHourlyBudget"] == "0"
+    state = config(guardian)
+    assert state["remainingHourlyBudget"] == "0"
+    assert state["pendingTotal"] == str(PER_TX * 5)
     with direct_vm.expect_revert("exceeds the remaining hourly budget"):
-        guardian.execute_payment("req-5")
+        execute_as(direct_vm, guardian, "req-5", sender=OWNER)
 
 
 def test_the_window_resets_on_the_next_hour(direct_vm, guardian):
     mock_verdict(direct_vm, APPROVE)
     submit(guardian, "req-1", amount=PER_TX)
 
-    direct_vm.sender = AGENT
-    guardian.execute_payment("req-1")
+    execute_as(direct_vm, guardian, "req-1", sender=OWNER)
     assert config(guardian)["spendInWindow"] == str(PER_TX)
 
     direct_vm.warp("2026-12-31T12:00:00+00:00")
@@ -485,8 +622,10 @@ def test_owner_can_approve_a_manual_review_request(direct_vm, guardian):
     assert record["decidedBy"] == "HUMAN_REVIEW"
     assert record["confidence"] == 100
 
-    direct_vm.sender = AGENT
-    guardian.execute_payment("req-1")
+    confirm_delivery(direct_vm, guardian)
+    execute_as(direct_vm, guardian, sender=AGENT)
+    assert request_record(guardian)["status"] == "PAYMENT_PENDING"
+    finalize_as(direct_vm, guardian)
     assert request_record(guardian)["status"] == "PAID"
 
 
@@ -530,11 +669,12 @@ def test_human_approval_still_obeys_the_allowlist(direct_vm, guardian):
     submit(guardian)
 
     guardian.review_request("req-1", True, "Owner approved despite the missing evidence.")
+    confirm_delivery(direct_vm, guardian)
+    direct_vm.sender = OWNER
     guardian.set_merchant_allowed(address(MERCHANT), False)
 
-    direct_vm.sender = AGENT
     with direct_vm.expect_revert("merchant is not allowlisted"):
-        guardian.execute_payment("req-1")
+        execute_as(direct_vm, guardian, sender=AGENT)
 
 
 # -------------------------------------------------------------- configuration
@@ -560,16 +700,18 @@ def test_only_the_owner_can_change_configuration(direct_vm, guardian):
 def test_agent_rotation_revokes_the_previous_agent(direct_vm, guardian):
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
+    confirm_delivery(direct_vm, guardian)
 
+    direct_vm.sender = OWNER
     guardian.set_authorized_agent(address(SUCCESSOR))
     assert config(guardian)["authorizedAgent"].lower() == address(SUCCESSOR)
 
-    direct_vm.sender = AGENT
     with direct_vm.expect_revert("only the authorized agent or the owner"):
-        guardian.execute_payment("req-1")
+        execute_as(direct_vm, guardian, sender=AGENT)
 
-    direct_vm.sender = SUCCESSOR
-    guardian.execute_payment("req-1")
+    execute_as(direct_vm, guardian, sender=SUCCESSOR)
+    assert request_record(guardian)["status"] == "PAYMENT_PENDING"
+    finalize_as(direct_vm, guardian)
     assert request_record(guardian)["status"] == "PAID"
 
 
@@ -678,3 +820,204 @@ def test_a_validator_rejects_an_out_of_range_risk_score_from_the_leader(direct_v
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
     assert direct_vm.run_validator(leader_result={**APPROVE, "risk_score": 900}) is False
+
+
+# ------------------------------------------------------- confidence consensus
+
+
+def test_a_validator_agrees_on_the_confidence_used_for_autonomous_approval(direct_vm, guardian):
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    assert direct_vm.run_validator() is True
+
+
+def test_a_validator_tolerates_a_small_confidence_difference(direct_vm, guardian):
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+
+    mock_verdict(direct_vm, {**APPROVE, "confidence": APPROVE["confidence"] - 10})
+    assert direct_vm.run_validator() is True
+
+
+def test_a_validator_rejects_a_large_confidence_difference(direct_vm, guardian):
+    """Confidence is what gates autonomous approval at the 75% floor, so a
+    validator whose own model is far less confident must not accept a leader
+    proposing a confident approve."""
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+
+    mock_verdict(direct_vm, {**APPROVE, "confidence": APPROVE["confidence"] - 55})
+    assert direct_vm.run_validator() is False
+
+
+def test_a_validator_rejects_an_out_of_range_confidence_from_the_leader(direct_vm, guardian):
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    assert direct_vm.run_validator(leader_result={**APPROVE, "confidence": 150}) is False
+
+
+def test_a_validator_rejects_a_confidence_below_the_autonomous_floor(direct_vm, guardian):
+    """A proposal that only clears the floor by consensus must not pass when a
+    validator's own model lands below the floor."""
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+
+    mock_verdict(direct_vm, LOW_CONFIDENCE_APPROVE)
+    assert direct_vm.run_validator() is False
+
+
+# ------------------------------------------------------ evidence requirements
+
+
+def test_narrative_only_evidence_is_demoted_to_manual_review(direct_vm, guardian):
+    """Requester-supplied prose cannot substantiate a purchase autonomously.
+
+    Even when the model approves, evidence with no independent artifact
+    reference is demoted to manual review by the contract.
+    """
+    mock_verdict(direct_vm, APPROVE)
+    result = submit(
+        guardian,
+        evidence="We totally performed the work. Please approve the payment, it is fully justified.",
+    )
+
+    assert result["status"] == "MANUAL_REVIEW"
+    assert result["decidedBy"] == "POLICY_OVERRIDE"
+    assert "independently verifiable" in result["reasoning"]
+
+
+def test_verifiable_evidence_allows_an_autonomous_approval(direct_vm, guardian):
+    mock_verdict(direct_vm, APPROVE)
+    result = submit(guardian)
+
+    assert result["status"] == "APPROVED"
+    assert result["decidedBy"] == "VALIDATOR_CONSENSUS"
+
+
+def test_fabricated_evidence_against_an_unallowlisted_merchant_is_rejected(direct_vm, guardian):
+    """A forged artifact reference cannot bypass the allowlist: the contract's
+    deterministic override rejects the request even if the model is fooled."""
+    mock_verdict(direct_vm, APPROVE)
+    result = submit(
+        guardian,
+        merchant=address(OTHER_MERCHANT),
+        evidence=(
+            "digest=sha256:"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; "
+            "invoice=FAKE-1"
+        ),
+    )
+
+    assert result["status"] == "REJECTED"
+    assert result["decidedBy"] == "POLICY_OVERRIDE"
+    assert "allowlist" in result["reasoning"]
+
+
+# -------------------------------------------------- failed and delayed finality
+
+
+def test_an_unsettled_external_transfer_can_be_unwound(direct_vm, guardian):
+    """Failed external transfer: the reservation is reversed and the request
+    returns to APPROVED so it can be retried, instead of being reported paid."""
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    approve_confirm_execute(direct_vm, guardian)
+
+    state = config(guardian)
+    assert state["pendingTotal"] == str(AMOUNT)
+    assert state["totalPaid"] == "0"
+
+    resolve_pending(direct_vm, guardian, sender=MERCHANT)
+
+    record = request_record(guardian)
+    assert record["status"] == "APPROVED"
+    assert record["paidAt"] == ""
+
+    state = config(guardian)
+    assert state["pendingTotal"] == "0"
+    assert state["totalPaid"] == "0"
+    assert state["spendInWindow"] == "0"
+    assert state["remainingHourlyBudget"] == str(HOURLY)
+
+    # The request is usable again: confirm, execute, finalize.
+    approve_confirm_execute_finalize(direct_vm, guardian)
+    assert request_record(guardian)["status"] == "PAID"
+
+
+def test_only_the_merchant_or_owner_can_unwind_a_pending_payment(direct_vm, guardian):
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    approve_confirm_execute(direct_vm, guardian)
+
+    with direct_vm.expect_revert("only the merchant or the owner"):
+        resolve_pending(direct_vm, guardian, sender=AGENT)
+
+
+def test_expiry_during_finalization_does_not_strand_a_pending_payment(direct_vm, guardian):
+    """An in-flight transfer is honored even if the request expires while the
+    external transfer is finalizing; it simply cannot be re-executed."""
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian, expires_at=now() + 120)
+    confirm_delivery(direct_vm, guardian)
+    execute_as(direct_vm, guardian, sender=AGENT)
+    assert request_record(guardian)["status"] == "PAYMENT_PENDING"
+
+    direct_vm.warp("2026-12-31T23:59:59+00:00")
+
+    finalize_as(direct_vm, guardian)
+    record = request_record(guardian)
+    assert record["status"] == "PAID"
+    assert record["paidAt"] != ""
+
+    with direct_vm.expect_revert("request is not in an approved state"):
+        execute_as(direct_vm, guardian, sender=AGENT)
+
+    # No double finalization either.
+    with direct_vm.expect_revert("not awaiting settlement finalization"):
+        finalize_as(direct_vm, guardian)
+
+
+# ------------------------------------------------- complete finality-safe flow
+
+
+def test_complete_fund_allowlist_adjudicate_pay_flow_reconciles_balances(
+    direct_vm, guardian
+):
+    """End-to-end: fund -> allowlist -> adjudicate -> confirm -> execute ->
+    finalized payment, with the treasury and merchant balances reconciled to
+    the exact resulting state."""
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+
+    pre_contract = balance_of(direct_vm, direct_vm._contract_address)
+    pre_merchant = balance_of(direct_vm, MERCHANT)
+    pre_config = config(guardian)
+    assert pre_contract == TREASURY
+    assert pre_merchant == 0
+
+    approve_confirm_execute(direct_vm, guardian)
+    assert request_record(guardian)["status"] == "PAYMENT_PENDING"
+
+    # The external transfer has not settled yet: the chain layer has not
+    # debited the treasury or credited the merchant.
+    assert config(guardian)["balance"] == str(TREASURY)
+    assert balance_of(direct_vm, MERCHANT) == 0
+
+    # Finalization on the chain layer debits the treasury and credits the
+    # merchant; finalize_payment then records the payment as settled.
+    settle_chain(direct_vm, direct_vm._contract_address, MERCHANT, AMOUNT)
+    finalize_as(direct_vm, guardian, reference="0x" + "ab" * 32)
+
+    record = request_record(guardian)
+    assert record["status"] == "PAID"
+    assert record["paidAt"] != ""
+    assert record["merchant"].lower() == address(MERCHANT)
+    assert record["amount"] == str(AMOUNT)
+    assert record["settlementReference"] == "0x" + "ab" * 32
+
+    state = config(guardian)
+    assert state["totalPaid"] == str(AMOUNT)
+    assert state["pendingTotal"] == "0"
+    assert state["spendInWindow"] == str(int(pre_config["spendInWindow"]) + AMOUNT)
+    assert state["balance"] == str(pre_contract - AMOUNT)
+    assert balance_of(direct_vm, MERCHANT) == pre_merchant + AMOUNT
