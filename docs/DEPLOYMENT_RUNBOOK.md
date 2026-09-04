@@ -20,9 +20,11 @@ balances are simulated in Studio's own database. It is a build-and-demo
 environment, not a production deployment. There is no EVM chain layer and no
 ghost contracts; EVM-contract interaction beyond value transfers to plain
 addresses is not supported. Native value transfers to addresses — the one thing
-this contract needs to pay a merchant — do work, but are best verified by
-checking the recipient's balance after settlement, as Studio does not model the
-chain layer.
+this contract needs to pay a merchant — do work, but because the transfer is an
+external message that settles on finalization, the contract keeps the request in
+`PAYMENT_PENDING` until `finalize_payment` confirms it, and verification should
+include reading the recipient's balance after finalization, as Studio does not
+model the chain layer.
 
 GenLayer mainnet is not live (`genlayer-js` rejects `mainnet` as a network).
 
@@ -56,7 +58,7 @@ under PowerShell. `scripts/preflight.mjs` sets it for you.
 ## Test Layers
 
 ```powershell
-npm test            # 1. contract lint + validation, then 60 direct-mode tests
+npm test            # 1. contract lint + validation, then 73 direct-mode tests
 npx tsc --noEmit    # 2. application typecheck
 npm run build       # 3. production build
 ```
@@ -93,8 +95,9 @@ the network.
 1. Open [studio.genlayer.com](https://studio.genlayer.com).
 2. In Studio's account selector, create two accounts:
    - **Account 1** — the deployer. Becomes the **owner**: sets policy, pauses,
-     withdraws, rotates the agent.
-   - **Account 2** — the **agent**. May only settle already-approved payments.
+      withdraws, rotates the agent.
+   - **Account 2** — the **agent**. May execute already-approved payments, and
+      only after the merchant confirms delivery.
    - Create a **third account** later to act as a merchant to receive a payment.
 3. Load `contracts/guardian_budget.py` and fill the constructor fields:
 
@@ -124,9 +127,16 @@ With the app running (`npm run dev`) and the owner wallet connected:
 2. Allowlist a merchant.
 3. Submit a request and wait for `APPROVED` / `VALIDATOR_CONSENSUS` — each
    validator makes a real LLM call, so this takes tens of seconds.
-4. Settle it. Confirm the treasury debited and the merchant balance increased.
-5. Exercise the rejection paths: over-limit, duplicate, unallowlisted merchant,
-   stale approval (de-allowlist after approval), and pause.
+4. As the merchant account, confirm delivery with a verifiable reference, then
+   execute as the agent or owner. The request goes `PAYMENT_PENDING` — the app
+   reports nothing as paid yet.
+5. Finalize the payment as the merchant or owner once the transfer has settled.
+   Confirm the request is `PAID` with a `paidAt`, the treasury debited, and the
+   merchant balance increased by exactly the amount.
+6. Exercise the rejection paths: over-limit, duplicate, unallowlisted merchant,
+   narrative-only evidence, an agent trying to execute without the merchant's
+   delivery confirmation, stale approval (de-allowlist after approval), and
+   pause.
 
 ## Evidence To Capture
 
@@ -137,9 +147,12 @@ Do not fill these in from memory.
 - Treasury funding transaction
 - An adjudicated approval, showing the validator verdict recorded on-chain
 - A `POLICY_OVERRIDE` rejection of a model-approved request
+- A narrative-only evidence demotion to `MANUAL_REVIEW`
 - A settlement refused after a post-approval policy change
 - A pause/resume cycle
-- A settled payment and the merchant's balance
+- A `PAYMENT_PENDING` authorization followed by its finalized `PAID` record,
+  with the settlement reference
+- A finalized payment and the merchant's balance read matching the debit
 
 ## Stop Conditions
 

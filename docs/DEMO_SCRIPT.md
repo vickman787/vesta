@@ -22,9 +22,9 @@ audited unless current evidence supports each statement.
 **0:00-0:25 — Problem and thesis**
 
 "AI agents can buy compute, data, and software, but an unrestricted wallet turns
-a model error or a compromised workflow into direct financial loss. Autonomous
-Budgeter splits the judgment from the authority. Validator consensus decides
-whether a purchase is justified; the contract decides whether it is permitted."
+a model error or a compromised workflow into direct financial loss. Vesta splits
+the judgment from the authority. Validator consensus decides whether a purchase
+is justified; the contract decides whether it is permitted."
 
 Show the operations console, not a marketing page.
 
@@ -39,17 +39,25 @@ the decisions, and the funds. This dashboard is a view over three read methods."
 
 **0:50-1:45 — Adjudicated approval**
 
-Submit a request to the allowlisted merchant with a real purpose and evidence.
-While it runs, explain what is happening: the leader asks its model for a
-structured judgment; every validator asks its own model the same question and
-compares the decision and the risk score. Disagreement rotates the leader.
+Submit a request to the allowlisted merchant with a real purpose and structured,
+verifiable evidence (a ticket, quote, or digest reference). While it runs, explain
+what is happening: the leader asks its model for a structured judgment; every
+validator asks its own model the same question and compares the decision, the
+risk score, and the confidence that gates autonomous approval. Disagreement
+rotates the leader.
 
 Show the recorded decision: the verdict, the risk score, the confidence, the
-reasoning, and `VALIDATOR_CONSENSUS` as the provenance. Then settle it as the
-agent and open the explorer receipt.
+reasoning, and `VALIDATOR_CONSENSUS` as the provenance. Then, as the merchant,
+confirm delivery of the deliverable; execute as the agent (the request goes
+`PAYMENT_PENDING`, not `PAID` — nothing is reported as paid at acceptance); and,
+once the transfer has finalized, finalize the settlement as the merchant or
+owner. Show the request become `PAID` with its `paidAt` and settlement
+reference, and open the explorer receipt.
 
-Say: "The verdict is on-chain, not in a log file. And the approval is not a
-standing permission — execution re-checks every limit against live state."
+Say: "The verdict is on-chain, not in a log file. The approval is not a standing
+permission — execution re-checks every limit against live state, the agent
+cannot pay on a narrative alone, and a payment is only reported paid once its
+transfer is finalized and reconciled."
 
 **1:45-2:15 — The contract overruling the model**
 

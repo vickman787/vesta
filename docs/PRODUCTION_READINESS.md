@@ -12,14 +12,27 @@ evidence. Everything below that matters for real funds is unverified.
 
 - [x] The Intelligent Contract is implemented and passes `genvm-lint check`.
 - [x] Direct-mode tests cover adjudication, every deterministic override,
-      settlement authorization, expiry, pause, window accounting, human review,
-      access control, and validator agreement and disagreement.
-- [x] Contract deployed on Studionet (`0x9Bda595e6cB407eD45A42bB42bcb507423B16355`),
-      with owner and agent as separate accounts.
-- [x] End-to-end happy path demonstrated on Studio: funding, an adjudicated
-      approval by real validators, and a settled payment with the treasury
-      debited.
+      narrative-only evidence, delivery-confirmed agent execution, the
+      finality-safe `PAYMENT_PENDING` -> `PAID` lifecycle, failed-transfer
+      unwinding, expiry during finalization, confidence-based validator
+      agreement, window accounting, human review, access control, and validator
+      agreement and disagreement.
+- [x] Contract deployed on Studionet (`0x6FC19feBc5aa3C194C21BEb0C2F085eb9E130d68`),
+      with owner and agent as separate accounts, and the constructor limits
+      confirmed through `get_config`.
+- [x] End-to-end happy path demonstrated on Studio against this revision:
+      funding, an adjudicated approval by real validators (`svc-1`, confidence
+      90, risk 20, `VALIDATOR_CONSENSUS`), a merchant delivery confirmation, and
+      a finalized payment with the treasury debited and the merchant balance
+      read matching.
 - [ ] `POLICY_OVERRIDE` rejection of a model-approved request, demonstrated live.
+- [ ] Narrative-only evidence demoted to `MANUAL_REVIEW`, demonstrated live.
+- [x] An agent refused for lack of a merchant delivery confirmation, demonstrated
+      live: `execute_payment` reverted before `confirm_delivery`, then succeeded
+      after it.
+- [x] A `PAYMENT_PENDING` record finalized into `PAID`, demonstrated live with a
+      settlement reference, `pendingTotal` returning to zero and `totalPaid`
+      moving only at finalization.
 - [ ] Settlement refused after a post-approval policy change, demonstrated live.
 - [ ] Pause/resume cycle, demonstrated live.
 - [ ] Integration tests pass against a live network (`npm run test:integration`).
