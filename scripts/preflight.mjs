@@ -41,10 +41,9 @@ function run(label, command, args) {
   if (result.status !== 0) fail(`${label} exited with code ${result.status}`);
 }
 
-const linter = venvBin('genvm-lint');
 const python = venvBin('python');
 
-if (!linter || !python) {
+if (!python) {
   const venvPython = path.join(VENV, process.platform === 'win32' ? 'Scripts' : 'bin', 'python');
   fail(
     `no virtualenv found at ./${VENV}. Create one and install the contract tooling:\n` +
@@ -53,7 +52,11 @@ if (!linter || !python) {
   );
 }
 
-run('Contract lint and validation', linter, ['check', CONTRACT]);
+// The linter is invoked through `python -m genvm_linter.cli` rather than the
+// genvm-lint console script: on Windows, pip's uv-managed entry-point
+// trampoline can fail to canonicalize its script path, while the module entry
+// point behaves identically on every platform.
+run('Contract lint and validation', python, ['-m', 'genvm_linter.cli', 'check', CONTRACT]);
 // tests/integration needs a live network and a funded account, so it is excluded
 // here and run explicitly via `npm run test:integration`.
 run('Direct-mode contract tests', python, [
