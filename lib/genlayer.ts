@@ -73,7 +73,12 @@ export async function connectWalletNetwork(client: Client): Promise<void> {
 
 // --------------------------------------------------------------------- domain
 
-export type RequestStatus = 'APPROVED' | 'REJECTED' | 'MANUAL_REVIEW' | 'PAID';
+export type RequestStatus =
+  | 'APPROVED'
+  | 'REJECTED'
+  | 'MANUAL_REVIEW'
+  | 'PAYMENT_PENDING'
+  | 'PAID';
 export type Decision = 'approve' | 'reject' | 'manual_review';
 export type DecidedBy = 'VALIDATOR_CONSENSUS' | 'POLICY_OVERRIDE' | 'HUMAN_REVIEW';
 
@@ -94,6 +99,10 @@ export type PaymentRequest = {
   confidence: number;
   decidedBy: DecidedBy;
   paidAt: string;
+  deliveryConfirmedBy: string;
+  deliveryReference: string;
+  reservationWindowStart: number;
+  settlementReference: string;
 };
 
 export type TreasuryConfig = {
@@ -107,6 +116,7 @@ export type TreasuryConfig = {
   remainingHourlyBudget: bigint;
   balance: bigint;
   totalPaid: bigint;
+  pendingTotal: bigint;
   paused: boolean;
   requestCount: number;
 };
@@ -128,6 +138,18 @@ function integer(value: unknown, label: string): number {
     throw new Error(`${label} was not an integer`);
   }
   return value;
+}
+
+function optInteger(value: unknown, label: string): number {
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  if (typeof value === 'undefined' || value === null) return 0;
+  throw new Error(`${label} was not an integer`);
+}
+
+function optText(value: unknown, label: string): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'undefined' || value === null) return '';
+  throw new Error(`${label} was not a string`);
 }
 
 function wei(value: unknown, label: string): bigint {
@@ -155,6 +177,7 @@ function toConfig(value: unknown): TreasuryConfig {
     remainingHourlyBudget: wei(data.remainingHourlyBudget, 'remainingHourlyBudget'),
     balance: wei(data.balance, 'balance'),
     totalPaid: wei(data.totalPaid, 'totalPaid'),
+    pendingTotal: wei(data.pendingTotal ?? '0', 'pendingTotal'),
     paused: data.paused === true,
     requestCount: integer(data.requestCount, 'requestCount'),
   };
@@ -181,7 +204,11 @@ function toRequest(value: unknown): PaymentRequest {
     riskScore: integer(data.riskScore, 'riskScore'),
     confidence: integer(data.confidence, 'confidence'),
     decidedBy: text(data.decidedBy, 'decidedBy') as DecidedBy,
-    paidAt: text(data.paidAt, 'paidAt'),
+    paidAt: optText(data.paidAt, 'paidAt'),
+    deliveryConfirmedBy: optText(data.deliveryConfirmedBy, 'deliveryConfirmedBy'),
+    deliveryReference: optText(data.deliveryReference, 'deliveryReference'),
+    reservationWindowStart: optInteger(data.reservationWindowStart, 'reservationWindowStart'),
+    settlementReference: optText(data.settlementReference, 'settlementReference'),
   };
 }
 
@@ -231,12 +258,23 @@ export async function fetchMerchantAllowed(
 
 export type WriteOutcome = { hash: TransactionHash; status: TransactionStatus };
 
+const TERMINAL_NON_FINAL: ReadonlySet<string> = new Set([
+  TransactionStatus.UNDETERMINED,
+  TransactionStatus.CANCELED,
+  TransactionStatus.VALIDATORS_TIMEOUT,
+  TransactionStatus.LEADER_TIMEOUT,
+]);
+
 /**
- * Send a write transaction and wait for consensus to accept it.
+ * Send a write transaction and wait for it to FINALIZE, checking the execution
+ * result before reporting anything as successful.
  *
- * A transaction can be accepted by consensus and still have failed in
- * execution, so the execution result is checked separately and surfaced as an
- * error rather than reported as success.
+ * Nothing here is reported as done at acceptance: a transaction is only
+ * `FINALIZED` once the validator set has finished with it, and a finalize that
+ * ended in `FINISHED_WITH_ERROR` or never reached a result is surfaced as an
+ * error rather than success. Funding, adjudication, configuration changes, and
+ * payment authorization all go through this same gate, so the UI never claims
+ * a state change the chain has not confirmed.
  */
 export async function write(
   client: Client,
@@ -254,19 +292,44 @@ export async function write(
 
   const receipt = await client.waitForTransactionReceipt({
     hash,
-    status: TransactionStatus.ACCEPTED,
+    status: TransactionStatus.FINALIZED,
+    interval: 1500,
+    retries: 200,
   });
 
-  if (receipt.statusName === TransactionStatus.UNDETERMINED) {
+  const statusName = receipt.statusName;
+  if (statusName && TERMINAL_NON_FINAL.has(statusName)) {
+    throw new Error(await terminalStatusError(client, hash, statusName));
+  }
+  if (statusName && statusName !== TransactionStatus.FINALIZED) {
     throw new Error(
-      'Validators could not agree on this transaction, so it did not change contract state.',
+      `Transaction ended in ${statusName} without finalizing, so its state change is not confirmed.`,
     );
   }
   if (receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
     throw new Error(await executionError(client, hash));
   }
+  if (receipt.txExecutionResultName === ExecutionResult.NOT_VOTED) {
+    throw new Error(
+      'The transaction finalized without a recorded execution result. Check the explorer before trusting any state change.',
+    );
+  }
 
-  return { hash, status: receipt.statusName ?? TransactionStatus.ACCEPTED };
+  return { hash, status: TransactionStatus.FINALIZED };
+}
+
+async function terminalStatusError(
+  client: Client,
+  hash: TransactionHash,
+  statusName: TransactionStatus,
+): Promise<string> {
+  if (statusName === TransactionStatus.UNDETERMINED) {
+    return (
+      'Validators could not agree on this transaction, so it did not change ' +
+      'contract state. The transaction is final but undetermined.'
+    );
+  }
+  return `The transaction ended in ${statusName}. Check the explorer for the outcome.`;
 }
 
 /** Read the contract's own error message out of the execution trace. */
@@ -279,4 +342,137 @@ async function executionError(client: Client, hash: TransactionHash): Promise<st
     // Tracing is best-effort; fall through to the generic message.
   }
   return 'The contract rejected this call. Check the transaction in the explorer for the reason.';
+}
+
+// ------------------------------------------------------- finality and reconcile
+
+/** Native GEN balance of any address, as a decimal wei string (best effort). */
+export async function fetchNativeBalance(
+  client: Client,
+  address: string,
+): Promise<bigint | null> {
+  try {
+    const hex = (await client.request({
+      method: 'eth_getBalance',
+      params: [address as `0x${string}`, 'latest'],
+    })) as string;
+    return typeof hex === 'string' ? BigInt(hex) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Wait for the child transaction(s) triggered by an emitted transfer to
+ * finalize. Returns the finalized transfer identifiers, or an empty array when
+ * the network reports no triggered transactions (e.g. the transfer finalized
+ * within the parent transaction).
+ */
+export async function waitForTriggeredTransfersFinalized(
+  client: Client,
+  hash: TransactionHash,
+  retries = 100,
+  interval = 1500,
+): Promise<TransactionHash[]> {
+  let ids: TransactionHash[] = [];
+  for (let attempt = 0; attempt < retries && ids.length === 0; attempt += 1) {
+    try {
+      ids = await client.getTriggeredTransactionIds({ hash });
+    } catch {
+      ids = [];
+    }
+    if (ids.length === 0) await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+  const finalized: TransactionHash[] = [];
+  for (const id of ids) {
+    const receipt = await client.waitForTransactionReceipt({
+      hash: id,
+      status: TransactionStatus.FINALIZED,
+      interval,
+      retries,
+    });
+    if (receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
+      throw new Error(`An emitted transfer failed on the chain layer (${id}).`);
+    }
+    finalized.push(id);
+  }
+  return finalized;
+}
+
+export type PaymentReconciliation = {
+  requestId: string;
+  status: PaymentRequest['status'];
+  paidAt: string;
+  recipient: string;
+  transferred: bigint;
+  treasuryBalance: bigint;
+  totalPaid: bigint;
+  pendingTotal: bigint;
+  spendInWindow: bigint;
+  merchantBalance: bigint | null;
+  matches: boolean;
+};
+
+/**
+ * Reconcile the exact resulting contract state after a payment finalizes.
+ *
+ * Reads the request record and the treasury config back from the contract and
+ * verifies the fields the reviewer requires: the request is PAID with a
+ * paidAt, the recipient and transferred amount match the request, and the
+ * treasury balance, totalPaid, pendingTotal, and spending-window debit moved by
+ * exactly the transferred amount. The merchant's native balance is read
+ * best-effort as an independent cross-check.
+ *
+ * `before` must be a snapshot captured immediately before `execute_payment` was
+ * authorized (an empty object disables the delta checks).
+ */
+export async function reconcileFinalizedPayment(
+  client: Client,
+  address: string,
+  requestId: string,
+  before: {
+    request: PaymentRequest | null;
+    config: TreasuryConfig;
+    merchantBalance: bigint | null;
+  },
+): Promise<PaymentReconciliation> {
+  const request = await fetchRequests(client, address, 100).then(
+    (items) => items.find((item) => item.requestId === requestId) ?? null,
+  );
+  const config = await fetchConfig(client, address);
+  const merchantBalance = request
+    ? await fetchNativeBalance(client, request.merchant)
+    : null;
+
+  const expectedRecipient = before.request?.merchant ?? '';
+  const expectedAmount = before.request?.amount ?? 0n;
+  const matches =
+    request !== null &&
+    request.status === 'PAID' &&
+    request.paidAt !== '' &&
+    request.merchant.toLowerCase() === expectedRecipient.toLowerCase() &&
+    request.amount === expectedAmount &&
+    config.totalPaid === before.config.totalPaid + expectedAmount &&
+    config.pendingTotal ===
+      (before.config.pendingTotal > expectedAmount
+        ? before.config.pendingTotal - expectedAmount
+        : 0n) &&
+    (before.config.windowStart === config.windowStart
+      ? config.spendInWindow === before.config.spendInWindow + expectedAmount
+      : true) &&
+    config.balance === before.config.balance - expectedAmount;
+
+  return {
+    requestId,
+    status: request?.status ?? 'REJECTED',
+    paidAt: request?.paidAt ?? '',
+    recipient: request?.merchant ?? '',
+    transferred: request?.amount ?? 0n,
+    treasuryBalance: config.balance,
+    totalPaid: config.totalPaid,
+    pendingTotal: config.pendingTotal,
+    spendInWindow: config.spendInWindow,
+    merchantBalance,
+    matches,
+  };
 }
