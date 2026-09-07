@@ -36,11 +36,11 @@ TREASURY = 10**18
 AMOUNT = 10**15
 
 # Evidence must anchor a purchase to an independently verifiable artifact for an
-# autonomous approval (see _evidence_has_reference in the contract).
+# autonomous approval (see _evidence_has_reference in the contract), and the
+# artifact's sha256 digest must be committed on-chain by the merchant of record.
+DIGEST_HEX = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
 VERIFIABLE_EVIDENCE = (
-    "ticket=OPS-204; quote=Q-8821; vendor=acme-compute; "
-    "digest=sha256:"
-    "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+    f"ticket=OPS-204; quote=Q-8821; vendor=acme-compute; digest=sha256:{DIGEST_HEX}"
 )
 
 APPROVE = {
@@ -92,11 +92,18 @@ def fund(vm, amount: int = TREASURY) -> None:
 
 @pytest.fixture
 def guardian(direct_vm, direct_deploy):
-    """A deployed treasury owned by OWNER, with MERCHANT allowlisted and funded."""
+    """A deployed treasury owned by OWNER, with MERCHANT allowlisted and funded.
+
+    The merchant of record also commits the default artifact digest, so the
+    default evidence is independently verifiable for every approval-path test.
+    """
     direct_vm.sender = OWNER
     contract = direct_deploy(CONTRACT, address(AGENT), PER_TX, HOURLY)
     contract.set_merchant_allowed(address(MERCHANT), True)
     fund(direct_vm)
+    direct_vm.sender = MERCHANT
+    contract.commit_artifact(DIGEST_HEX, "invoice Q-8821")
+    direct_vm.sender = OWNER
     return contract
 
 
@@ -133,7 +140,7 @@ def confirm_delivery(
     vm,
     contract,
     request_id: str = "req-1",
-    reference: str = "delivery=invoice INV-8821; digest=sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    reference: str = "delivery=invoice INV-8821",
 ) -> None:
     """The merchant of record attests the deliverable was completed."""
     vm.sender = MERCHANT
@@ -150,15 +157,15 @@ def finalize_as(
     vm,
     contract,
     request_id: str = "req-1",
-    reference: str = "0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-    sender=MERCHANT,
+    reference: str = "0x" + "ab" * 32,
+    sender=OWNER,
 ) -> dict:
-    """Confirm, once the external transfer is finalized, that the payment landed."""
+    """Record a settled payment once the transfer has been observed to finalize."""
     vm.sender = sender
     return json.loads(contract.finalize_payment(request_id, reference))
 
 
-def resolve_pending(vm, contract, request_id: str = "req-1", sender=MERCHANT) -> dict:
+def resolve_pending(vm, contract, request_id: str = "req-1", sender=OWNER) -> dict:
     """Unwind a payment whose external transfer never settled."""
     vm.sender = sender
     return json.loads(contract.resolve_pending_payment(request_id))
@@ -913,6 +920,66 @@ def test_fabricated_evidence_against_an_unallowlisted_merchant_is_rejected(direc
     assert "allowlist" in result["reasoning"]
 
 
+def test_a_requester_typed_digest_without_a_commit_is_not_independently_verified(direct_vm, guardian):
+    """Requester-created markers are not evidence. A digest the requester merely
+    types, with no on-chain commitment by the merchant, cannot pass the
+    autonomous approval gate even when the model approves."""
+    mock_verdict(direct_vm, APPROVE)
+    result = submit(
+        guardian,
+        evidence=(
+            "ticket=OPS-777; invoice=INV-999; "
+            "digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ),
+    )
+
+    assert result["status"] == "MANUAL_REVIEW"
+    assert result["decidedBy"] == "POLICY_OVERRIDE"
+    assert "committed on-chain" in result["reasoning"]
+
+
+def test_a_digest_committed_by_a_stranger_does_not_verify(direct_vm, guardian):
+    """Independence is issuer-specific: a digest committed by some other account
+    does not verify a request whose merchant of record did not commit it."""
+    mock_verdict(direct_vm, APPROVE)
+    direct_vm.sender = STRANGER
+    guardian.commit_artifact(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "some other deliverable",
+    )
+    direct_vm.sender = OWNER
+
+    result = submit(
+        guardian,
+        evidence=(
+            "digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ),
+    )
+
+    assert result["status"] == "MANUAL_REVIEW"
+    assert "committed on-chain" in result["reasoning"]
+
+
+def test_commit_artifact_rejects_a_malformed_digest(direct_vm, guardian):
+    with direct_vm.expect_revert("64-character sha256 hex"):
+        guardian.commit_artifact("not-a-digest", "invoice Q-1")
+
+
+def test_an_artifact_cannot_be_reclaimed_by_another_account(direct_vm, guardian):
+    direct_vm.sender = STRANGER
+    with direct_vm.expect_revert("already committed by another account"):
+        guardian.commit_artifact(DIGEST_HEX, "claiming someone else's artifact")
+
+    # The merchant's commitment is untouched: an approval citing it still verifies.
+    direct_vm.sender = OWNER
+    mock_verdict(direct_vm, APPROVE)
+    result = submit(guardian)
+    assert result["status"] == "APPROVED"
+    assert request_record(guardian)["artifactVerified"] is True
+
+
 # -------------------------------------------------- failed and delayed finality
 
 
@@ -927,7 +994,7 @@ def test_an_unsettled_external_transfer_can_be_unwound(direct_vm, guardian):
     assert state["pendingTotal"] == str(AMOUNT)
     assert state["totalPaid"] == "0"
 
-    resolve_pending(direct_vm, guardian, sender=MERCHANT)
+    resolve_pending(direct_vm, guardian)
 
     record = request_record(guardian)
     assert record["status"] == "APPROVED"
@@ -944,13 +1011,44 @@ def test_an_unsettled_external_transfer_can_be_unwound(direct_vm, guardian):
     assert request_record(guardian)["status"] == "PAID"
 
 
-def test_only_the_merchant_or_owner_can_unwind_a_pending_payment(direct_vm, guardian):
+def test_only_the_owner_can_unwind_a_pending_payment(direct_vm, guardian):
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
     approve_confirm_execute(direct_vm, guardian)
 
-    with direct_vm.expect_revert("only the merchant or the owner"):
+    with direct_vm.expect_revert("only the owner"):
         resolve_pending(direct_vm, guardian, sender=AGENT)
+    with direct_vm.expect_revert("only the owner"):
+        resolve_pending(direct_vm, guardian, sender=MERCHANT)
+
+
+def test_only_the_owner_can_finalize_a_payment(direct_vm, guardian):
+    """No signer of a PAYMENT_PENDING record can mark it paid on assertion
+    alone: settlement finalization is the owner's custody operation."""
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    approve_confirm_execute(direct_vm, guardian)
+
+    with direct_vm.expect_revert("only the owner"):
+        finalize_as(direct_vm, guardian, sender=MERCHANT)
+
+    finalize_as(direct_vm, guardian, sender=OWNER)
+    assert request_record(guardian)["status"] == "PAID"
+
+
+def test_finalize_rejects_a_free_form_settlement_reference(direct_vm, guardian):
+    """The settlement reference must be an observed 0x-prefixed 32-byte
+    identifier, not arbitrary requester-typed text."""
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    approve_confirm_execute(direct_vm, guardian)
+
+    with direct_vm.expect_revert("0x-prefixed 64-character hex"):
+        finalize_as(direct_vm, guardian, reference="it landed, trust me")
+    with direct_vm.expect_revert("0x-prefixed 64-character hex"):
+        finalize_as(direct_vm, guardian, reference="0x1234")
+
+    assert request_record(guardian)["status"] == "PAYMENT_PENDING"
 
 
 def test_expiry_during_finalization_does_not_strand_a_pending_payment(direct_vm, guardian):
