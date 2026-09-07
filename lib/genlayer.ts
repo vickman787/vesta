@@ -22,6 +22,7 @@ import { createClient } from 'genlayer-js';
 import { studionet } from 'genlayer-js/chains';
 import { TransactionStatus, ExecutionResult } from 'genlayer-js/types';
 import type { GenLayerChain, GenLayerClient, TransactionHash } from 'genlayer-js/types';
+import { assessReceipt } from './receipt-outcome';
 
 /** The only network this app talks to. */
 export const NETWORK_NAME = 'studionet';
@@ -103,6 +104,8 @@ export type PaymentRequest = {
   deliveryReference: string;
   reservationWindowStart: number;
   settlementReference: string;
+  artifactDigest: string;
+  artifactVerified: boolean;
 };
 
 export type TreasuryConfig = {
@@ -150,6 +153,10 @@ function optText(value: unknown, label: string): string {
   if (typeof value === 'string') return value;
   if (typeof value === 'undefined' || value === null) return '';
   throw new Error(`${label} was not a string`);
+}
+
+function optBool(value: unknown): boolean {
+  return value === true;
 }
 
 function wei(value: unknown, label: string): bigint {
@@ -209,6 +216,8 @@ function toRequest(value: unknown): PaymentRequest {
     deliveryReference: optText(data.deliveryReference, 'deliveryReference'),
     reservationWindowStart: optInteger(data.reservationWindowStart, 'reservationWindowStart'),
     settlementReference: optText(data.settlementReference, 'settlementReference'),
+    artifactDigest: optText(data.artifactDigest, 'artifactDigest'),
+    artifactVerified: optBool(data.artifactVerified),
   };
 }
 
@@ -258,13 +267,6 @@ export async function fetchMerchantAllowed(
 
 export type WriteOutcome = { hash: TransactionHash; status: TransactionStatus };
 
-const TERMINAL_NON_FINAL: ReadonlySet<string> = new Set([
-  TransactionStatus.UNDETERMINED,
-  TransactionStatus.CANCELED,
-  TransactionStatus.VALIDATORS_TIMEOUT,
-  TransactionStatus.LEADER_TIMEOUT,
-]);
-
 /**
  * Send a write transaction and wait for it to FINALIZE, checking the execution
  * result before reporting anything as successful.
@@ -297,39 +299,15 @@ export async function write(
     retries: 200,
   });
 
-  const statusName = receipt.statusName;
-  if (statusName && TERMINAL_NON_FINAL.has(statusName)) {
-    throw new Error(await terminalStatusError(client, hash, statusName));
-  }
-  if (statusName && statusName !== TransactionStatus.FINALIZED) {
-    throw new Error(
-      `Transaction ended in ${statusName} without finalizing, so its state change is not confirmed.`,
-    );
-  }
-  if (receipt.txExecutionResultName === ExecutionResult.FINISHED_WITH_ERROR) {
-    throw new Error(await executionError(client, hash));
-  }
-  if (receipt.txExecutionResultName === ExecutionResult.NOT_VOTED) {
-    throw new Error(
-      'The transaction finalized without a recorded execution result. Check the explorer before trusting any state change.',
-    );
+  const assessment = assessReceipt(receipt.statusName, receipt.txExecutionResultName);
+  if (!assessment.success) {
+    if (assessment.category === 'execution-error') {
+      throw new Error(await executionError(client, hash));
+    }
+    throw new Error(assessment.message);
   }
 
   return { hash, status: TransactionStatus.FINALIZED };
-}
-
-async function terminalStatusError(
-  client: Client,
-  hash: TransactionHash,
-  statusName: TransactionStatus,
-): Promise<string> {
-  if (statusName === TransactionStatus.UNDETERMINED) {
-    return (
-      'Validators could not agree on this transaction, so it did not change ' +
-      'contract state. The transaction is final but undetermined.'
-    );
-  }
-  return `The transaction ended in ${statusName}. Check the explorer for the outcome.`;
 }
 
 /** Read the contract's own error message out of the execution trace. */
@@ -475,4 +453,96 @@ export async function reconcileFinalizedPayment(
     merchantBalance,
     matches,
   };
+}
+
+export type SettlementVerification = {
+  transferIds: TransactionHash[];
+  matched: boolean;
+  reasons: string[];
+};
+
+/**
+ * Verify that a payment's external transfer was observed to finalize and that
+ * the resulting state reconciles, BEFORE finalize_payment is allowed.
+ *
+ * This is what closes the "mark paid from a pasted reference" path: the app
+ * only calls `finalize_payment` after this check passes, and it passes the
+ * observed transfer identifier — never user-typed text. `before` must be a
+ * snapshot captured immediately before `execute_payment`.
+ */
+export async function verifySettlementTransfer(
+  client: Client,
+  address: string,
+  executeHash: string,
+  requestId: string,
+  before: {
+    request: PaymentRequest | null;
+    config: TreasuryConfig;
+    merchantBalance: bigint | null;
+  },
+): Promise<SettlementVerification> {
+  const transferIds = await waitForTriggeredTransfersFinalized(
+    client,
+    executeHash as TransactionHash,
+  );
+  const request = await fetchRequests(client, address, 100).then(
+    (items) => items.find((item) => item.requestId === requestId) ?? null,
+  );
+  const config = await fetchConfig(client, address);
+
+  const reasons: string[] = [];
+  const expectedRecipient = before.request?.merchant ?? '';
+  const expectedAmount = before.request?.amount ?? 0n;
+  const expectedMerchantBalance = before.merchantBalance;
+  const merchantBalance = request
+    ? await fetchNativeBalance(client, request.merchant)
+    : null;
+
+  if (!request) reasons.push('The request could not be read back from the contract.');
+  else {
+    if (request.status !== 'PAYMENT_PENDING') {
+      reasons.push(
+        `Expected the request to be PAYMENT_PENDING, found ${request.status}.`,
+      );
+    }
+    if (request.merchant.toLowerCase() !== expectedRecipient.toLowerCase()) {
+      reasons.push('The recorded recipient does not match the request.');
+    }
+    if (request.amount !== expectedAmount) {
+      reasons.push('The recorded amount does not match the request.');
+    }
+  }
+
+  if (config.pendingTotal !== before.config.pendingTotal + expectedAmount) {
+    reasons.push(
+      `pendingTotal did not reserve ${expectedAmount} (expected ${
+        before.config.pendingTotal + expectedAmount
+      }, found ${config.pendingTotal}).`,
+    );
+  }
+  if (config.totalPaid !== before.config.totalPaid) {
+    reasons.push('totalPaid moved before the payment was finalized.');
+  }
+
+  // The transfer must have been *observed* to settle, one way or another:
+  // through a finalized triggered transfer, or through the treasury and
+  // merchant balances reflecting the exact debit and credit. A PAYMENT_PENDING
+  // record with none of these is not evidence that money moved.
+  const transferObserved = transferIds.length > 0;
+  const treasuryDebited = config.balance === before.config.balance - expectedAmount;
+  const merchantCredited =
+    expectedMerchantBalance !== null &&
+    merchantBalance !== null &&
+    merchantBalance === expectedMerchantBalance + expectedAmount;
+
+  if (!transferObserved && !treasuryDebited && !merchantCredited) {
+    reasons.push(
+      'No finalized transfer was observed and neither the treasury nor the merchant balance reflects the amount settling.',
+    );
+  }
+  if (merchantBalance !== null && !merchantCredited) {
+    reasons.push('The merchant balance does not reflect the transferred amount.');
+  }
+
+  return { transferIds, matched: reasons.length === 0, reasons };
 }
