@@ -12,9 +12,11 @@ import {
   explorerTransactionUrl,
   fetchConfig,
   fetchMerchantAllowed,
+  fetchNativeBalance,
   fetchRequests,
   injectedProvider,
   readClient,
+  verifySettlementTransfer,
   write,
   writeClient,
   type PaymentRequest,
@@ -37,7 +39,14 @@ const EMPTY_CONFIG: TreasuryConfig = {
   requestCount: 0,
 };
 
-const DIGEST_REF = 'sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08';
+const DIGEST_HEX = '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08';
+const DIGEST_REF = `sha256:${DIGEST_HEX}`;
+
+type PaymentSnapshot = {
+  request: PaymentRequest | null;
+  config: TreasuryConfig;
+  merchantBalance: bigint | null;
+};
 
 const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 
@@ -75,8 +84,14 @@ export default function Dashboard() {
   const [perTxDraft, setPerTxDraft] = useState('0.01');
   const [hourlyDraft, setHourlyDraft] = useState('0.05');
   const [reviewReason, setReviewReason] = useState('');
-  const [deliveryRef, setDeliveryRef] = useState(`delivery=invoice INV-8821; digest=${DIGEST_REF}`);
-  const [settlementRef, setSettlementRef] = useState('0x' + 'a'.repeat(64));
+  const [deliveryRef, setDeliveryRef] = useState(`delivery=invoice INV-8821`);
+  const [artifactDigest, setArtifactDigest] = useState(DIGEST_HEX);
+  const [artifactRef, setArtifactRef] = useState('invoice Q-8821');
+  const [pendingAuth, setPendingAuth] = useState<{
+    requestId: string;
+    hash: string;
+    snapshot: PaymentSnapshot;
+  } | null>(null);
 
   const selected = requests.find((item) => item.requestId === selectedId) ?? requests[0] ?? null;
   const isOwner = sameAddress(account, treasury.owner);
@@ -209,13 +224,86 @@ export default function Dashboard() {
     if (ok) setSelectedId(selected.requestId);
   }
 
-  async function finalizePayment() {
-    if (!selected) return;
-    const ok = await send('Settlement finalization', 'finalize_payment', [
-      selected.requestId,
-      settlementRef.trim(),
+  async function commitArtifact() {
+    const ok = await send('Artifact commit', 'commit_artifact', [
+      artifactDigest.trim(),
+      artifactRef.trim(),
     ]);
-    if (ok) setSelectedId(selected.requestId);
+    if (ok) setSelectedId(selected?.requestId ?? '');
+  }
+
+  async function authorizePaymentExecute() {
+    if (!selected) return;
+    const client = writeClient(account as `0x${string}`);
+    const rc = readClient();
+    const snapshotRequest = await fetchRequests(rc, contractAddress, 100).then(
+      (items) => items.find((item) => item.requestId === selected.requestId) ?? null,
+    );
+    const snapshotConfig = await fetchConfig(rc, contractAddress).catch(() => treasury);
+    const merchantBalance = snapshotRequest
+      ? await fetchNativeBalance(rc, snapshotRequest.merchant)
+      : null;
+
+    setBusy('Payment authorization');
+    try {
+      note('Payment authorization: submitted to consensus...');
+      const outcome = await write(client, contractAddress, 'execute_payment', [
+        selected.requestId,
+      ]);
+      setPendingAuth({
+        requestId: selected.requestId,
+        hash: outcome.hash,
+        snapshot: {
+          request: snapshotRequest,
+          config: snapshotConfig,
+          merchantBalance,
+        },
+      });
+      note(
+        'Payment authorized and finalized on-chain. It is PAYMENT_PENDING — nothing is paid yet. Finalize only after the transfer settles and reconciles.',
+        false,
+        outcome.hash,
+      );
+      await loadTreasury();
+    } catch (error) {
+      note(`Payment authorization: ${message(error, 'failed')}`, true);
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function finalizeVerified() {
+    if (!selected || !pendingAuth || pendingAuth.requestId !== selected.requestId) {
+      note(
+        'No tracked authorization for this request. Execute it from this console first so the transfer can be observed.',
+        true,
+      );
+      return;
+    }
+    setBusy('Verify & finalize');
+    try {
+      const verification = await verifySettlementTransfer(
+        readClient(),
+        contractAddress,
+        pendingAuth.hash,
+        selected.requestId,
+        pendingAuth.snapshot,
+      );
+      if (!verification.matched) {
+        note(`Refusing to finalize: ${verification.reasons.join(' ')}`, true);
+        return;
+      }
+      const reference = verification.transferIds[0] ?? (pendingAuth.hash as string);
+      const ok = await send('Settlement finalization', 'finalize_payment', [
+        selected.requestId,
+        reference,
+      ]);
+      if (ok) setPendingAuth(null);
+    } catch (error) {
+      note(`Verify & finalize: ${message(error, 'failed')}`, true);
+    } finally {
+      setBusy('');
+    }
   }
 
   async function unwindPayment() {
@@ -223,7 +311,10 @@ export default function Dashboard() {
     const ok = await send('Pending payment unwind', 'resolve_pending_payment', [
       selected.requestId,
     ]);
-    if (ok) setSelectedId(selected.requestId);
+    if (ok) {
+      setPendingAuth(null);
+      setSelectedId(selected.requestId);
+    }
   }
 
   async function submitRequest() {
@@ -574,6 +665,31 @@ export default function Dashboard() {
               <p className="hint">
                 Fixture label: {merchantName}. The purpose and evidence reach the validators as
                 fenced, untrusted data, and the contract re-checks policy regardless of the verdict.
+                For an autonomous approval the evidence&apos;s sha256 digest must have been committed
+                on-chain by the merchant of record — requester-typed markers are not verification.
+              </p>
+            </Panel>
+
+            <Panel title="Artifact registry" kicker="04b / Independent evidence">
+              <label>
+                Digest (sha256 hex)
+                <input value={artifactDigest} onChange={(event) => setArtifactDigest(event.target.value)} />
+              </label>
+              <label>
+                Reference
+                <input value={artifactRef} onChange={(event) => setArtifactRef(event.target.value)} />
+              </label>
+              <button
+                className="action-wide muted"
+                disabled={!online || Boolean(busy)}
+                onClick={commitArtifact}
+              >
+                Commit artifact (as this account)
+              </button>
+              <p className="hint">
+                The issuer — the merchant of record — commits the deliverable digest here. It is an
+                attributable, on-chain commitment a requester cannot fabricate. Connect the merchant
+                account to commit its digest before submitting a request that cites it.
               </p>
             </Panel>
 
@@ -647,6 +763,14 @@ export default function Dashboard() {
                       <strong>{short(selected.settlementReference)}</strong>
                     </>
                   )}
+                  {selected.artifactDigest && (
+                    <>
+                      <span>Artifact digest</span>
+                      <strong className={selected.artifactVerified ? 'good' : 'warn'}>
+                        {selected.artifactVerified ? 'merchant-committed' : 'unverified'}
+                      </strong>
+                    </>
+                  )}
                   {selected.paidAt && (
                     <>
                       <span>Paid</span>
@@ -718,11 +842,7 @@ export default function Dashboard() {
                         <button
                           className="action-wide"
                           disabled={!isAgent || Boolean(busy)}
-                          onClick={() =>
-                            void send('Payment authorization', 'execute_payment', [
-                              selected.requestId,
-                            ])
-                          }
+                          onClick={() => void authorizePaymentExecute()}
                         >
                           Execute payment (agent)
                         </button>
@@ -741,11 +861,7 @@ export default function Dashboard() {
                       <button
                         className="action-wide"
                         disabled={!isOwner || Boolean(busy)}
-                        onClick={() =>
-                          void send('Payment authorization', 'execute_payment', [
-                            selected.requestId,
-                          ])
-                        }
+                        onClick={() => void authorizePaymentExecute()}
                       >
                         Execute as owner (override)
                       </button>
@@ -762,40 +878,39 @@ export default function Dashboard() {
                   <>
                     <p className="hint warn">
                       Payment is authorized and the transfer is settling on the chain layer — it is
-                      not yet reported as paid. The hourly-window debit is reserved. Finalize once the
-                      transfer is finalized, or unwind it if the transfer failed.
+                      not yet reported as paid. Nothing here is finalized on a typed reference: the
+                      owner must verify that the triggered transfer was observed to finalize and that
+                      the state reconciles, and only then finalize.
                     </p>
-                    {(isMerchant || isOwner) && (
-                      <>
-                        <label>
-                          Settlement reference (finalized transfer id)
-                          <input
-                            value={settlementRef}
-                            onChange={(event) => setSettlementRef(event.target.value)}
-                            placeholder="0x..."
-                          />
-                        </label>
-                        <div className="grid grid-cols-2 gap-3">
-                          <button
-                            className="action-wide"
-                            disabled={Boolean(busy)}
-                            onClick={finalizePayment}
-                          >
-                            Finalize settlement
-                          </button>
-                          <button
-                            className="action-wide danger"
-                            disabled={Boolean(busy)}
-                            onClick={unwindPayment}
-                          >
-                            Mark transfer failed
-                          </button>
-                        </div>
-                      </>
+                    {pendingAuth && pendingAuth.requestId === selected.requestId && isOwner && (
+                      <button
+                        className="action-wide"
+                        disabled={Boolean(busy)}
+                        onClick={() => void finalizeVerified()}
+                      >
+                        Verify transfer and finalize
+                      </button>
                     )}
-                    {!isMerchant && !isOwner && (
+                    {isOwner && (
+                      <button
+                        className="action-wide danger"
+                        disabled={Boolean(busy)}
+                        onClick={unwindPayment}
+                      >
+                        Mark transfer failed (unwind)
+                      </button>
+                    )}
+                    {!isOwner && (
                       <p className="hint warn">
-                        Connect the merchant of record or the owner to finalize or unwind this payment.
+                        Only the owner can finalize or unwind a pending payment after verifying the
+                        transfer. The merchant confirms delivery; the owner settles.
+                      </p>
+                    )}
+                    {isOwner && (!pendingAuth || pendingAuth.requestId !== selected.requestId) && (
+                      <p className="hint">
+                        To finalize, the authorization must have been executed from this console so its
+                        triggered transfer can be observed. Select that request and use &quot;Execute&quot;,
+                        then come back here.
                       </p>
                     )}
                   </>
