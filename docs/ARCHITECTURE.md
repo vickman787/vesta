@@ -1,7 +1,7 @@
 # Architecture And Flows
 
 This document describes the implemented GenLayer architecture. The Intelligent
-Contract passes the GenVM linter, validator, and a 73-case direct-mode test
+Contract passes the GenVM linter, validator, and a 79-case direct-mode test
 suite. It is deployed on **Studionet** (chain 61999) and verified end to end;
 see the root README for exact status.
 
@@ -107,14 +107,28 @@ Authorization is not payment. `execute_payment` reserves the hourly-window debit
 and the in-flight value, moves the record to `PAYMENT_PENDING`, and emits the
 transfer. Because the transfer is an external message to the chain layer, it
 settles on finalization; until then the request is never reported as `PAID`.
-`finalize_payment`, callable by the merchant or the owner, moves the record to
-`PAID`, records `paidAt` and the settlement reference, and clears the
-reservation once the finalized transfer and the resulting state — recipient,
-amount, treasury balance, `totalPaid`, and the spending-window debit — are
-confirmed. A transfer that never settles is unwound by
-`resolve_pending_payment`, which releases the reservation and returns the
-request to `APPROVED`. Expiry during finalization is non-destructive: an
-in-flight transfer is honored, it simply cannot be re-executed.
+`PAYMENT_PENDING` cannot be turned into `PAID` by assertion: `finalize_payment` is
+owner-only, takes the observed transfer identifier (not free-form text), and is
+called by the console only after the triggered transfer was observed to finalize
+and the state and balances reconciled. It moves the record to `PAID`, records
+`paidAt` and the settlement reference, and clears the reservation. A transfer
+that never settles is unwound by `resolve_pending_payment` (owner), which
+releases the reservation and returns the request to `APPROVED`. Expiry during
+finalization is non-destructive: an in-flight transfer is honored, it simply
+cannot be re-executed.
+
+## Artifact Registry
+
+Autonomous approval requires evidence whose sha256 digest was committed on-chain
+by the merchant of record via `commit_artifact`. The registry is a public,
+attributable bulletin board: a requester can type any digest into the evidence,
+but only the issuing account can commit a digest, and the commitment binds the
+artifact to that issuer. `submit_request` asserts
+`evidenceDigestCommittedByMerchant` as a trusted fact for the validators and then
+applies it as a deterministic gate: an `approve` whose digest was not committed
+by the merchant of record is demoted to `MANUAL_REVIEW`. This is what makes the
+artifact independently verifiable inside a sandbox with no external oracle — the
+requester cannot manufacture the commitment.
 
 `review_request` lets the owner overturn the model, not the policy. An
 owner-approved request still has to survive every check above, and the agent
@@ -130,12 +144,12 @@ still needs the merchant's delivery confirmation.
    transactions.
 4. A request is submitted; validators adjudicate it inside the transaction.
 5. Owner resolves anything in `MANUAL_REVIEW` with an on-chain reason.
-6. The merchant of record confirms delivery, releasing the agent's authority.
+6. The merchant of record commits the deliverable digest and, later, confirms
+   delivery, releasing the agent's authority.
 7. The agent or the owner authorizes the payment; the request goes
    `PAYMENT_PENDING` while the transfer settles.
-8. The merchant or the owner finalizes the payment once the transfer is
-   finalized; the request becomes `PAID` and the UI reconciles the resulting
-   state and balances.
+8. The owner verifies in the console that the triggered transfer finalized and
+   the state reconciles, then finalizes the payment; the request becomes `PAID`.
 9. Owner pauses execution, confirms an authorization is refused, then resumes.
 
 ## Security And Failure Flows
@@ -146,6 +160,7 @@ still needs the merchant's delivery confirmation.
 | Connected account is not the owner | Owner-only controls are disabled in the UI and rejected by the contract |
 | Injected instructions in merchant text | Fenced as data; instruction-like content is grounds for `manual_review`; policy override still applies |
 | Narrative-only evidence | `approve` demoted to `MANUAL_REVIEW` by the contract — requester text alone cannot substantiate a purchase |
+| Digest not committed by the merchant | `approve` demoted to `MANUAL_REVIEW` — requester-typed markers are not independent verification |
 | Conflicting validator confidence | Validator rejects the proposal when its own confidence differs by more than 15 points |
 | Malformed LLM output | Transaction fails rather than defaulting; validator disagreement rotates the leader |
 | Validators cannot agree | Transaction goes undetermined and contract state is unchanged |
@@ -159,7 +174,8 @@ still needs the merchant's delivery confirmation.
 | Merchant de-allowlisted after approval | `execute_payment` refuses |
 | Limit lowered after approval | `execute_payment` refuses |
 | Hourly window exhausted | `execute_payment` refuses; window resets on the hour |
-| Unresolved or failed external transfer | `resolve_pending_payment` releases the reservation and returns the request to `APPROVED` |
+| Unresolved or failed external transfer | `resolve_pending_payment` (owner) releases the reservation and returns the request to `APPROVED` |
+| Pending payment marked paid from a typed reference | `finalize_payment` is owner-only and takes the observed transfer identifier; the console refuses to finalize until the transfer is observed and reconciles |
 | Emergency pause | Agent settlement blocked; owner withdrawal and configuration still work |
 | Agent key compromise | Delivery condition, limits, allowlist, and pause bound the loss; owner rotates the agent |
 | Execution failure after finalization | The UI waits for `FINALIZED`, checks the execution result, and reports failure instead of success |

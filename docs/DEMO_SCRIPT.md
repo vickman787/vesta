@@ -39,8 +39,8 @@ the decisions, and the funds. This dashboard is a view over three read methods."
 
 **0:50-1:45 — Adjudicated approval**
 
-Submit a request to the allowlisted merchant with a real purpose and structured,
-verifiable evidence (a ticket, quote, or digest reference). While it runs, explain
+Submit a request to the allowlisted merchant with a real purpose and evidence
+that cites a sha256 digest the merchant committed on-chain. While it runs, explain
 what is happening: the leader asks its model for a structured judgment; every
 validator asks its own model the same question and compares the decision, the
 risk score, and the confidence that gates autonomous approval. Disagreement
@@ -50,14 +50,15 @@ Show the recorded decision: the verdict, the risk score, the confidence, the
 reasoning, and `VALIDATOR_CONSENSUS` as the provenance. Then, as the merchant,
 confirm delivery of the deliverable; execute as the agent (the request goes
 `PAYMENT_PENDING`, not `PAID` — nothing is reported as paid at acceptance); and,
-once the transfer has finalized, finalize the settlement as the merchant or
-owner. Show the request become `PAID` with its `paidAt` and settlement
-reference, and open the explorer receipt.
+as the owner, verify that the transfer was observed to finalize and the state
+reconciles, then finalize. Show the request become `PAID` with its `paidAt` and
+the observed settlement reference, and open the explorer receipt.
 
 Say: "The verdict is on-chain, not in a log file. The approval is not a standing
 permission — execution re-checks every limit against live state, the agent
-cannot pay on a narrative alone, and a payment is only reported paid once its
-transfer is finalized and reconciled."
+cannot pay on a narrative alone, requester-typed evidence is not verification,
+and a payment is only reported paid after its transfer is observed to finalize
+and reconciled."
 
 **1:45-2:15 — The contract overruling the model**
 

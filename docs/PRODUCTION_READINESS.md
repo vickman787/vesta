@@ -12,21 +12,27 @@ evidence. Everything below that matters for real funds is unverified.
 
 - [x] The Intelligent Contract is implemented and passes `genvm-lint check`.
 - [x] Direct-mode tests cover adjudication, every deterministic override,
-      narrative-only evidence, delivery-confirmed agent execution, the
-      finality-safe `PAYMENT_PENDING` -> `PAID` lifecycle, failed-transfer
-      unwinding, expiry during finalization, confidence-based validator
-      agreement, window accounting, human review, access control, and validator
-      agreement and disagreement.
-- [x] Contract deployed on Studionet (`0x6FC19feBc5aa3C194C21BEb0C2F085eb9E130d68`),
+      narrative-only evidence, artifact-registry verification (requester-typed
+      vs merchant-committed digests), delivery-confirmed agent execution, the
+      finality-safe `PAYMENT_PENDING` -> `PAID` lifecycle, owner-only
+      finalization, failed-transfer unwinding, expiry during finalization,
+      confidence-based validator agreement, window accounting, human review,
+      access control, and validator agreement and disagreement.
+- [x] Receipt finality tests cover the accepted -> appealed / reverted receipt
+      path: ACCEPTED is never success, an in-flight appeal is not final, and
+      CANCELED, UNDETERMINED, timeouts, and finalized-execution failures are all
+      reported as failures (node test runner, wired into `npm test`).
+- [x] Contract deployed on Studionet (`0xAaa55C41AC58f1E3Dec6EBDd5323eA010f89EE04`),
       with owner and agent as separate accounts, and the constructor limits
       confirmed through `get_config`.
 - [x] End-to-end happy path demonstrated on Studio against this revision:
-      funding, an adjudicated approval by real validators (`svc-1`, confidence
-      90, risk 20, `VALIDATOR_CONSENSUS`), a merchant delivery confirmation, and
-      a finalized payment with the treasury debited and the merchant balance
-      read matching.
+      funding, an adjudicated approval by real validators (`svc-2`, confidence
+      90, risk 12, merchant-committed digest verified), a merchant delivery
+      confirmation, and a finalized payment with the treasury debited and the
+      merchant balance read matching.
 - [ ] `POLICY_OVERRIDE` rejection of a model-approved request, demonstrated live.
-- [ ] Narrative-only evidence demoted to `MANUAL_REVIEW`, demonstrated live.
+- [ ] Narrative-only evidence and an uncommitted digest demoted to
+      `MANUAL_REVIEW`, demonstrated live.
 - [x] An agent refused for lack of a merchant delivery confirmation, demonstrated
       live: `execute_payment` reverted before `confirm_delivery`, then succeeded
       after it.

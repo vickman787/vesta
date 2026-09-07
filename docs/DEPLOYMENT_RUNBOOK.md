@@ -58,7 +58,7 @@ under PowerShell. `scripts/preflight.mjs` sets it for you.
 ## Test Layers
 
 ```powershell
-npm test            # 1. contract lint + validation, then 73 direct-mode tests
+npm test            # 1. contract lint + validation, then 79 direct-mode tests
 npx tsc --noEmit    # 2. application typecheck
 npm run build       # 3. production build
 ```
@@ -125,18 +125,23 @@ With the app running (`npm run dev`) and the owner wallet connected:
 
 1. Fund the treasury (0.05 GEN).
 2. Allowlist a merchant.
-3. Submit a request and wait for `APPROVED` / `VALIDATOR_CONSENSUS` — each
-   validator makes a real LLM call, so this takes tens of seconds.
-4. As the merchant account, confirm delivery with a verifiable reference, then
-   execute as the agent or owner. The request goes `PAYMENT_PENDING` — the app
-   reports nothing as paid yet.
-5. Finalize the payment as the merchant or owner once the transfer has settled.
-   Confirm the request is `PAID` with a `paidAt`, the treasury debited, and the
-   merchant balance increased by exactly the amount.
+3. As the merchant, commit the artifact digest your evidence will cite
+   (`commit_artifact`), then submit a request whose evidence carries
+   `digest=sha256:<that digest>` and wait for `APPROVED` /
+   `VALIDATOR_CONSENSUS` — each validator makes a real LLM call, so this takes
+   tens of seconds.
+4. As the merchant account, confirm delivery, then execute as the agent or
+   owner. The request goes `PAYMENT_PENDING` — the app reports nothing as paid
+   yet.
+5. As the owner, use the console's verify-and-finalize step, which observes the
+   triggered transfer, reconciles the state and balances, and only then calls
+   `finalize_payment` with the observed transfer identifier. Confirm the request
+   is `PAID` with a `paidAt`, the treasury debited, and the merchant balance
+   increased by exactly the amount.
 6. Exercise the rejection paths: over-limit, duplicate, unallowlisted merchant,
-   narrative-only evidence, an agent trying to execute without the merchant's
-   delivery confirmation, stale approval (de-allowlist after approval), and
-   pause.
+   narrative-only evidence, a digest the merchant never committed, an agent
+   trying to execute without the merchant's delivery confirmation, stale
+   approval (de-allowlist after approval), and pause.
 
 ## Evidence To Capture
 
