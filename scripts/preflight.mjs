@@ -67,5 +67,15 @@ run('Direct-mode contract tests', python, [
   '--ignore=tests/integration',
 ]);
 
-console.log('\nPreflight passed: contract lints and all direct-mode tests pass.');
+// Receipt-outcome logic is pure TypeScript exercised with the node test runner.
+// It covers the accepted -> appealed / reverted receipt path that direct-mode
+// contract tests cannot reach.
+run('Receipt finality tests', process.execPath, [
+  '--import',
+  'tsx',
+  '--test',
+  'tests/receipt-outcome.test.ts',
+]);
+
+console.log('\nPreflight passed: contract lints, all direct-mode tests, and the receipt finality tests pass.');
 console.log('Deploy contracts/guardian_budget.py at https://studio.genlayer.com');
