@@ -1,0 +1,5 @@
+Vesta demo deliverable - invoice Q-8821
+Vendor: acme-compute
+Amount: 2000000000000000 wei
+Purpose: inference capacity for the analytics batch
+Delivery: completed and confirmed by the merchant of record
