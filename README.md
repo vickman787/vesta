@@ -15,13 +15,15 @@ happens. The decision to approve or reject a purchase is made *inside* the
 contract, by validator LLM consensus, and recorded on-chain next to the payment
 it authorizes. There is no decision server, no API key, and no database.
 
-> **Status:** the artifact-registry revision is deployed on Studionet and verified
-> working end to end — funded, adjudicated by real validators, delivery confirmed
-> by the merchant, and settled after an observed, reconciled finalization. The
-> contract passes `genvm-lint check`, 79 direct-mode tests plus receipt finality
-> tests, and the app typechecks and builds. Studio state is temporary and
-> gasless: Studio is for building and demoing, not a production deployment, and
-> no independent security audit has been performed.
+> **Status:** the contract passes `genvm-lint check`, 87 direct-mode tests plus
+> receipt finality tests, and the app typechecks and builds. Earlier revisions
+> were verified end to end on Studionet. This revision adds validator-side web
+> verification (artifact contents and the finalized transfer receipt) and
+> permissionless lifecycle actions; its direct-mode coverage is green, but it
+> has not yet been demonstrated live, because that requires a reachable
+> `settlement_verifier_url` and outbound web access from the validators. Studio
+> state is temporary and gasless: not a production deployment, and no independent
+> security audit has been performed.
 
 ## Why AI Is Necessary
 
@@ -74,11 +76,12 @@ the request duplicates a recent one, or the amount exceeds the per-transaction
 limit, the remaining hourly budget, or the treasury balance. An approval below
 75% confidence is demoted to `MANUAL_REVIEW`, and so is any approval whose
 evidence cannot be independently verified. The evidence must carry a sha256
-digest that the merchant of record committed on-chain (`commit_artifact`); a
-requester-typed marker is not verification, because anyone can type a digest —
-only the merchant's attributable commitment binds an artifact to its issuer. The
-validators must agree on the confidence value itself before that 75% threshold
-can pass.
+digest that the merchant of record committed on-chain together with a URL, and
+the validators themselves fetch that URL and hash the contents: an approval only
+stands when the fetched body hashes to the committed digest and the fetched
+content substantiates the amount, purpose, and delivery. A requester-typed marker
+is not verification. The validators must also agree on the confidence value
+before that 75% threshold can pass.
 
 `execute_payment` then re-checks everything against live state. An approval is a
 judgment at a moment in time, not a standing permission — so a merchant
@@ -88,17 +91,19 @@ The agent's execution authority is bound to a delivery confirmation by the
 merchant of record, so an approved narrative alone cannot trigger payment; the
 owner keeps an explicit override.
 
-Settlement is finality-safe. `execute_payment` only authorizes: it reserves the
-hourly-window debit and moves the record to `PAYMENT_PENDING` while the value
-transfer settles on the chain layer. The dapp never reports a funding,
-adjudication, configuration change, or payment as successful until the
-transaction is `FINALIZED` with a successful execution. A `PAYMENT_PENDING`
-record cannot be marked `PAID` on a typed reference: the owner must verify —
-through the console, which observes the triggered transfer and reconciles the
-contract state and balances — that the transfer actually settled, and only
-`finalize_payment` then records `PAID`, `paidAt`, and the observed transfer
-identifier. A transfer that never settles is unwound by
-`resolve_pending_payment`, which releases the reservation.
+Settlement is finality-safe and durably bound. `execute_payment` only
+authorizes: it reserves the hourly-window debit and moves the record to
+`PAYMENT_PENDING` while the value transfer settles on the chain layer. The dapp
+never reports a funding, adjudication, configuration change, or payment as
+successful until the transaction is `FINALIZED` with a successful execution, and
+a payment is only `PAID` once the transfer itself is verified. `finalize_payment`
+is permissionless but does not trust its caller: the validators independently
+fetch the transfer's receipt from `settlement_verifier_url` and confirm it
+finalized with this contract as sender, the merchant as recipient, and the exact
+amount. A receipt that cannot be fetched or does not match refuses finalization.
+`resolve_pending_payment` (also permissionless) unwinds a transfer that never
+settled, releasing the reservation. Lifecycle actions move no funds on their
+own, so they are open; authorization to spend stays with the agent and owner.
 
 Untrusted merchant text is fenced and explicitly demoted to data in the prompt,
 with instruction-like content named as grounds for manual review. That is a
@@ -117,26 +122,26 @@ The Guardian is deployed on Studionet at:
 
 With `owner` (`0x1eEf8295A36be966D845A040c610c502d41CC78b`) and `authorizedAgent`
 (`0xf38D0ee24f71c83c83c99cEEa99158ef61419CFe`) as two separate Studio accounts.
-The constructor limits are 0.01 GEN per transaction and 0.05 GEN per one-hour
-window, verified through `get_config` after deployment. Deploying again is a
-Studio-website action, not a CLI command: paste `contracts/guardian_budget.py`,
-fill the three constructor fields, and confirm in `get_config` that the limits
-survived the browser intact (they are 17-digit numbers, near JavaScript's
-safe-integer edge).
+The constructor takes four fields: `authorized_agent`, `per_transaction_limit`
+(0.01 GEN), `hourly_limit` (0.05 GEN), and `settlement_verifier_url` — an
+http(s) URL template containing `{tx}`, which validators fetch to confirm a
+finalized transfer. Deploying again is a Studio-website action: paste
+`contracts/guardian_budget.py`, fill the four fields, and confirm in `get_config`
+that the limits survived the browser intact (they are 17-digit numbers, near
+JavaScript's safe-integer edge).
 
 A third account acts as the merchant (`0x369CB3A968C5077E311648F488E755210C138845`
-in the verified run). That is not cosmetic: the merchant of record is the only
-account that can call `confirm_delivery`, which is what releases the agent's
-authority to execute a payment.
+in the earlier verified runs). That is not cosmetic: the merchant of record is
+the only account that can call `confirm_delivery`, and it is the account whose
+artifact commitment the validators verify.
 
-The current revision was exercised end to end against this deployment: the
-treasury was funded, `svc-2` was approved by real validator consensus at
-confidence 90 and risk 12 with the merchant-committed digest verified on-chain,
-delivery was confirmed by the merchant, the request moved `APPROVED` →
-`PAYMENT_PENDING` → `PAID`, and the settlement reference records the observed
-transfer identifier. The agent-refusal path — `execute_payment` reverting
-before the merchant confirms delivery — was demonstrated live on an earlier
-revision and is covered by the direct-mode suite.
+An earlier revision was exercised end to end against Studionet (funded,
+adjudicated by real validators, delivery confirmed, `PAYMENT_PENDING` finalized
+to `PAID`). This revision changes how the last two steps are verified: the
+validators now fetch the artifact URL and the transfer receipt themselves, and
+finalization is permissionless but bound to that fetched receipt. Those paths
+pass the direct-mode suite; demonstrating them live requires a reachable
+`settlement_verifier_url` and validator web access.
 
 ## Product Flow
 
@@ -144,11 +149,14 @@ revision and is covered by the direct-mode suite.
    owner.
 2. The owner funds it with GEN, authorizes an agent, sets limits, and allowlists
    merchants.
-3. The merchant of record commits the deliverable's sha256 digest on-chain
-   (`commit_artifact`) — the artifact a requester cannot fabricate.
+3. The merchant of record commits the deliverable's sha256 digest and the URL
+   it is served from (`commit_artifact`) — the artifact a requester cannot
+   fabricate and the validators will fetch.
 4. A merchant or labeled fixture submits a service request whose evidence cites
    that digest.
-5. Validators adjudicate it inside `submit_request` and the verdict is stored.
+5. Validators adjudicate it inside `submit_request`: they fetch the committed
+   URL, hash the contents, and judge the amount, purpose, and delivery from the
+   fetched artifact.
 6. The contract applies its deterministic policy over the verdict.
 7. A rejection is recorded and can never be settled. A manual review waits for an
    owner transaction carrying a written reason.
@@ -156,9 +164,9 @@ revision and is covered by the direct-mode suite.
    agent's authority to pay.
 9. The agent authorizes the payment and the contract re-checks the full policy
    before value leaves; the request moves to `PAYMENT_PENDING`.
-10. The owner verifies in the console that the triggered transfer finalized and
-    the state reconciles, then `finalize_payment` records `PAID` with the
-    observed transfer identifier. A transfer that never settles is unwound by
+10. Anyone may finalize once the validators verify the transfer's receipt from
+    `settlement_verifier_url`; `finalize_payment` then records `PAID` with the
+    transfer identifier. A transfer that never settles is unwound by
     `resolve_pending_payment`.
 
 ## Local Setup
@@ -178,7 +186,7 @@ Copy-Item .env.example .env
 Verify everything:
 
 ```powershell
-npm test          # contract lint + validation, then 79 direct-mode tests
+npm test          # contract lint + validation, then 87 direct-mode tests
 npx tsc --noEmit
 npm run build
 npm run dev
@@ -193,19 +201,21 @@ With the app running and the owner wallet connected:
 
 1. **Fund** the treasury (`0.05` in the Treasury controls panel).
 2. **Allowlist** a merchant — a third address.
-3. **Commit the artifact** as the merchant: paste the digest your evidence will
-   cite and commit it. Connect the merchant account to do this.
+3. **Commit the artifact** as the merchant: paste the digest and the URL it is
+   served from, then commit. The validators will fetch that URL, so it must be
+   reachable from the network validators run on.
 4. **Submit for adjudication.** This is the slow one: every validator makes a
-   real LLM call, so expect tens of seconds before `APPROVED` /
-   `VALIDATOR_CONSENSUS` appears.
+   real LLM call and fetches the artifact, so expect tens of seconds before
+   `APPROVED` / `VALIDATOR_CONSENSUS` appears.
 5. **Confirm delivery as the merchant** (the request's recipient account) — the
    agent cannot execute without it.
 6. **Execute as the agent or owner.** The request moves to `PAYMENT_PENDING` and
    the transfer settles on the chain layer; nothing is reported as paid yet.
-7. **Verify and finalize as the owner.** The console observes the triggered
-   transfer, reconciles the state and balances, and only then calls
-   `finalize_payment` with the observed transfer identifier. The record becomes
-   `PAID` with a `paidAt`.
+7. **Finalize.** Anyone may submit the transfer identifier; the validators fetch
+   its receipt from `settlement_verifier_url` and confirm it finalized with this
+   contract, the merchant, and the amount before the request becomes `PAID`. The
+   console preserves each write's hash, links to the explorer, and reconciles
+   pending writes after a reload.
 
 Then prove the interesting part — the contract overruling the models:
 

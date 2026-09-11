@@ -106,10 +106,14 @@ the network.
    | `authorized_agent` | Account 2's address |
    | `per_transaction_limit` | `10000000000000000` (0.01 GEN) |
    | `hourly_limit` | `50000000000000000` (0.05 GEN) |
+   | `settlement_verifier_url` | an http(s) URL template containing `{tx}`, e.g. `https://<host>/tx/{tx}` |
 
    Owner and agent must be separate accounts — the whole design depends on it.
    `per_transaction_limit` must not exceed `hourly_limit`, and neither may be
-   zero. An empty agent or zero limits reverts the deploy.
+   zero. An empty agent, zero limits, or a verifier URL without `{tx}` reverts
+   the deploy. The verifier URL must be reachable from the network the
+   validators run on and must return the transfer's status, sender, recipient,
+   and amount — the validators fetch it to confirm finalization.
 4. Confirm the limits in `get_config` after deploying. They are 17-digit numbers
    near JavaScript's safe-integer edge; the browser could in principle mangle
    them, so verify they come back as the exact strings above.
@@ -133,15 +137,17 @@ With the app running (`npm run dev`) and the owner wallet connected:
 4. As the merchant account, confirm delivery, then execute as the agent or
    owner. The request goes `PAYMENT_PENDING` — the app reports nothing as paid
    yet.
-5. As the owner, use the console's verify-and-finalize step, which observes the
-   triggered transfer, reconciles the state and balances, and only then calls
-   `finalize_payment` with the observed transfer identifier. Confirm the request
-   is `PAID` with a `paidAt`, the treasury debited, and the merchant balance
-   increased by exactly the amount.
+5. Anyone may finalize: submit the transfer identifier, and the validators fetch
+   its receipt from `settlement_verifier_url` and confirm it finalized with this
+   contract, the merchant, and the amount before the request becomes `PAID` with
+   a `paidAt`. Confirm the treasury debited and the merchant balance increased by
+   exactly the amount. A transfer that never settled is unwound with
+   `resolve_pending_payment`.
 6. Exercise the rejection paths: over-limit, duplicate, unallowlisted merchant,
-   narrative-only evidence, a digest the merchant never committed, an agent
-   trying to execute without the merchant's delivery confirmation, stale
-   approval (de-allowlist after approval), and pause.
+   narrative-only evidence, a digest the merchant never committed, a fetched
+   artifact whose contents do not match the digest, an agent trying to execute
+   without the merchant's delivery confirmation, stale approval (de-allowlist
+   after approval), and pause.
 
 ## Evidence To Capture
 

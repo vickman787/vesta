@@ -13,32 +13,34 @@ evidence. Everything below that matters for real funds is unverified.
 - [x] The Intelligent Contract is implemented and passes `genvm-lint check`.
 - [x] Direct-mode tests cover adjudication, every deterministic override,
       narrative-only evidence, artifact-registry verification (requester-typed
-      vs merchant-committed digests), delivery-confirmed agent execution, the
-      finality-safe `PAYMENT_PENDING` -> `PAID` lifecycle, owner-only
-      finalization, failed-transfer unwinding, expiry during finalization,
-      confidence-based validator agreement, window accounting, human review,
-      access control, and validator agreement and disagreement.
+      vs merchant-committed digests, and validator-side fetch + content hashing),
+      delivery-confirmed agent execution, the finality-safe
+      `PAYMENT_PENDING` -> `PAID` lifecycle, permissionless finalization bound to
+      a fetched transfer receipt, failed-transfer unwinding, expiry during
+      finalization, confidence-based validator agreement, window accounting,
+      human review, access control, and validator agreement and disagreement.
 - [x] Receipt finality tests cover the accepted -> appealed / reverted receipt
       path: ACCEPTED is never success, an in-flight appeal is not final, and
       CANCELED, UNDETERMINED, timeouts, and finalized-execution failures are all
       reported as failures (node test runner, wired into `npm test`).
-- [x] Contract deployed on Studionet (`0xAaa55C41AC58f1E3Dec6EBDd5323eA010f89EE04`),
-      with owner and agent as separate accounts, and the constructor limits
+- [ ] Contract deployed on Studionet with a reachable `settlement_verifier_url`,
+      with owner and agent as separate accounts, and the constructor fields
       confirmed through `get_config`.
-- [x] End-to-end happy path demonstrated on Studio against this revision:
-      funding, an adjudicated approval by real validators (`svc-2`, confidence
-      90, risk 12, merchant-committed digest verified), a merchant delivery
-      confirmation, and a finalized payment with the treasury debited and the
-      merchant balance read matching.
+- [ ] End-to-end happy path demonstrated on Studio against the web-verified
+      revision: funding, validators fetching and hashing the committed artifact,
+      a merchant delivery confirmation, execution, and a payment finalized only
+      after the validators fetched a matching transfer receipt, with the
+      treasury debited and the merchant balance read matching.
+- [ ] Validator-side outbound web access confirmed on the target network (if
+      Studio blocks it, artifact verification and settlement go undetermined).
 - [ ] `POLICY_OVERRIDE` rejection of a model-approved request, demonstrated live.
-- [ ] Narrative-only evidence and an uncommitted digest demoted to
-      `MANUAL_REVIEW`, demonstrated live.
+- [ ] Narrative-only evidence, an uncommitted digest, and a fetched-content
+      digest mismatch each demoted to `MANUAL_REVIEW`, demonstrated live.
 - [x] An agent refused for lack of a merchant delivery confirmation, demonstrated
-      live: `execute_payment` reverted before `confirm_delivery`, then succeeded
-      after it.
-- [x] A `PAYMENT_PENDING` record finalized into `PAID`, demonstrated live with a
-      settlement reference, `pendingTotal` returning to zero and `totalPaid`
-      moving only at finalization.
+      live on an earlier revision (`execute_payment` reverted before
+      `confirm_delivery`).
+- [ ] A `PAYMENT_PENDING` record finalized into `PAID` on the web-verified
+      revision, demonstrated live with the transfer receipt fetched by validators.
 - [ ] Settlement refused after a post-approval policy change, demonstrated live.
 - [ ] Pause/resume cycle, demonstrated live.
 - [ ] Integration tests pass against a live network (`npm run test:integration`).

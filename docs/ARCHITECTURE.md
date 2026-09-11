@@ -107,28 +107,31 @@ Authorization is not payment. `execute_payment` reserves the hourly-window debit
 and the in-flight value, moves the record to `PAYMENT_PENDING`, and emits the
 transfer. Because the transfer is an external message to the chain layer, it
 settles on finalization; until then the request is never reported as `PAID`.
-`PAYMENT_PENDING` cannot be turned into `PAID` by assertion: `finalize_payment` is
-owner-only, takes the observed transfer identifier (not free-form text), and is
-called by the console only after the triggered transfer was observed to finalize
-and the state and balances reconciled. It moves the record to `PAID`, records
-`paidAt` and the settlement reference, and clears the reservation. A transfer
-that never settles is unwound by `resolve_pending_payment` (owner), which
-releases the reservation and returns the request to `APPROVED`. Expiry during
+`PAYMENT_PENDING` cannot be turned into `PAID` by assertion: `finalize_payment`
+is permissionless but trusts no caller — the validators fetch the transfer's
+receipt from `settlement_verifier_url` (a `{tx}` URL template fixed at deploy),
+confirm it is `FINALIZED` and references this contract as sender, the merchant as
+recipient, and the exact amount, and only then move the record to `PAID` and
+record `paidAt`. A receipt that cannot be fetched or does not match refuses
+finalization. `resolve_pending_payment`, also permissionless, unwinds a transfer
+that never settled and returns the request to `APPROVED`. Expiry during
 finalization is non-destructive: an in-flight transfer is honored, it simply
 cannot be re-executed.
 
 ## Artifact Registry
 
 Autonomous approval requires evidence whose sha256 digest was committed on-chain
-by the merchant of record via `commit_artifact`. The registry is a public,
-attributable bulletin board: a requester can type any digest into the evidence,
-but only the issuing account can commit a digest, and the commitment binds the
-artifact to that issuer. `submit_request` asserts
-`evidenceDigestCommittedByMerchant` as a trusted fact for the validators and then
-applies it as a deterministic gate: an `approve` whose digest was not committed
-by the merchant of record is demoted to `MANUAL_REVIEW`. This is what makes the
-artifact independently verifiable inside a sandbox with no external oracle — the
-requester cannot manufacture the commitment.
+by the merchant of record via `commit_artifact`, together with the URL the
+artifact is served from. The registry is a public, attributable record: a
+requester can type any digest into the evidence, but only the issuing account can
+commit it. During adjudication each validator independently fetches that URL,
+hashes the contents, and compares the result to the committed digest; the fetched
+content is also passed to the model to judge the amount, purpose, and delivery.
+`submit_request` asserts those facts and then applies them as deterministic
+gates: an `approve` whose digest was not committed by the merchant, or whose
+fetched contents did not hash to the digest, is demoted to `MANUAL_REVIEW`. This
+is what makes the artifact independently verifiable rather than
+requester-asserted.
 
 `review_request` lets the owner overturn the model, not the policy. An
 owner-approved request still has to survive every check above, and the agent
@@ -174,8 +177,9 @@ still needs the merchant's delivery confirmation.
 | Merchant de-allowlisted after approval | `execute_payment` refuses |
 | Limit lowered after approval | `execute_payment` refuses |
 | Hourly window exhausted | `execute_payment` refuses; window resets on the hour |
-| Unresolved or failed external transfer | `resolve_pending_payment` (owner) releases the reservation and returns the request to `APPROVED` |
-| Pending payment marked paid from a typed reference | `finalize_payment` is owner-only and takes the observed transfer identifier; the console refuses to finalize until the transfer is observed and reconciles |
+| Unresolved or failed external transfer | `resolve_pending_payment` (permissionless) releases the reservation and returns the request to `APPROVED` |
+| Pending payment marked paid from an assertion | `finalize_payment` is permissionless but the validators fetch the transfer receipt and require FINALIZED with matching sender, recipient, and amount before it records `PAID` |
+| Artifact contents do not match the committed digest | Validators hash the fetched body; the `approve` is demoted to `MANUAL_REVIEW` |
 | Emergency pause | Agent settlement blocked; owner withdrawal and configuration still work |
 | Agent key compromise | Delivery condition, limits, allowlist, and pause bound the loss; owner rotates the agent |
 | Execution failure after finalization | The UI waits for `FINALIZED`, checks the execution result, and reports failure instead of success |
