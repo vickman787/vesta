@@ -106,7 +106,7 @@ the network.
    | `authorized_agent` | Account 2's address |
    | `per_transaction_limit` | `10000000000000000` (0.01 GEN) |
    | `hourly_limit` | `50000000000000000` (0.05 GEN) |
-   | `settlement_verifier_url` | an http(s) URL template containing `{tx}`, e.g. `https://<host>/tx/{tx}` |
+   | `settlement_verifier_url` | an http(s) URL template containing `{tx}`, e.g. `https://explorer-studio.genlayer.com/api/transactions/{tx}` |
 
    Owner and agent must be separate accounts — the whole design depends on it.
    `per_transaction_limit` must not exceed `hourly_limit`, and neither may be
