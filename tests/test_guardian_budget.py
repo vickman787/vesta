@@ -15,6 +15,7 @@ Assertions otherwise check the contract's own accounting (`total_paid`,
 `pending_total`, `spend_in_window`) rather than the raw balance mid-flight.
 """
 
+import hashlib
 import json
 from datetime import datetime, timezone
 
@@ -35,10 +36,15 @@ HOURLY = 5 * 10**16
 TREASURY = 10**18
 AMOUNT = 10**15
 
-# Evidence must anchor a purchase to an independently verifiable artifact for an
-# autonomous approval (see _evidence_has_reference in the contract), and the
-# artifact's sha256 digest must be committed on-chain by the merchant of record.
-DIGEST_HEX = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+# The artifact the merchant commits and the validators independently fetch. Its
+# sha256 is the digest the evidence must cite and the fetched body must hash to.
+ARTIFACT_URL = "https://artifacts.example/invoice-Q-8821"
+ARTIFACT_BODY = (
+    "Invoice Q-8821. Vendor acme-compute. Amount 2000000000000000 wei. "
+    "Deliverable: inference capacity for the analytics batch."
+)
+DIGEST_HEX = hashlib.sha256(ARTIFACT_BODY.encode("utf-8")).hexdigest()
+VERIFIER_URL = "https://verify.example/tx/{tx}"
 VERIFIABLE_EVIDENCE = (
     f"ticket=OPS-204; quote=Q-8821; vendor=acme-compute; digest=sha256:{DIGEST_HEX}"
 )
@@ -80,9 +86,48 @@ def soon() -> int:
 
 
 def mock_verdict(vm, verdict: dict) -> None:
-    """Make every LLM call in this test return `verdict`."""
+    """Make every LLM call in this test return `verdict`.
+
+    The artifact web fetch is not an LLM call, so the artifact mock registered by
+    the fixture survives `clear_mocks()` only if it is re-registered; the
+    helpers below manage both together.
+    """
     vm.clear_mocks()
+    mock_artifact_web(vm)
     vm.mock_llm(r".*", json.dumps(verdict))
+
+
+def mock_artifact_web(vm, url: str = ARTIFACT_URL, body: str = ARTIFACT_BODY) -> None:
+    """Serve the committed artifact body to the validators' web fetch."""
+    vm.mock_web(url, {"method": "GET", "status": 200, "body": body})
+
+
+def mock_settlement(
+    vm,
+    tx: str = "0x" + "ab" * 32,
+    *,
+    contract_address=None,
+    merchant=address(MERCHANT),
+    amount: int = AMOUNT,
+    status: str = "FINALIZED",
+    body: str | None = None,
+) -> None:
+    """Serve a transfer receipt to the validators' settlement verification."""
+    if body is None:
+        contract_hex = (
+            address(contract_address)
+            if contract_address is not None
+            else "0x" + bytes().hex()
+        )
+        payload = {
+            "statusName": status,
+            "txExecutionResultName": "FINISHED_WITH_RETURN",
+            "sender": contract_hex,
+            "recipient": merchant,
+            "amount": str(amount),
+        }
+        body = json.dumps(payload)
+    vm.mock_web(r"verify\.example/tx/", {"method": "GET", "status": 200, "body": body})
 
 
 def fund(vm, amount: int = TREASURY) -> None:
@@ -94,16 +139,18 @@ def fund(vm, amount: int = TREASURY) -> None:
 def guardian(direct_vm, direct_deploy):
     """A deployed treasury owned by OWNER, with MERCHANT allowlisted and funded.
 
-    The merchant of record also commits the default artifact digest, so the
-    default evidence is independently verifiable for every approval-path test.
+    The merchant of record also commits the default artifact (with its URL), and
+    the artifact URL is served to the validators' web fetch, so the default
+    evidence is independently verifiable for every approval-path test.
     """
     direct_vm.sender = OWNER
-    contract = direct_deploy(CONTRACT, address(AGENT), PER_TX, HOURLY)
+    contract = direct_deploy(CONTRACT, address(AGENT), PER_TX, HOURLY, VERIFIER_URL)
     contract.set_merchant_allowed(address(MERCHANT), True)
     fund(direct_vm)
     direct_vm.sender = MERCHANT
-    contract.commit_artifact(DIGEST_HEX, "invoice Q-8821")
+    contract.commit_artifact(DIGEST_HEX, ARTIFACT_URL, "invoice Q-8821")
     direct_vm.sender = OWNER
+    mock_artifact_web(direct_vm)
     return contract
 
 
@@ -159,8 +206,24 @@ def finalize_as(
     request_id: str = "req-1",
     reference: str = "0x" + "ab" * 32,
     sender=OWNER,
+    *,
+    merchant: bytes = MERCHANT,
+    amount: int = AMOUNT,
+    mock: bool = True,
 ) -> dict:
-    """Record a settled payment once the transfer has been observed to finalize."""
+    """Record a settled payment once the finalized transfer is verified.
+
+    Registers a finalized receipt for `reference` unless the test is exercising
+    a verification failure (`mock=False`).
+    """
+    if mock:
+        mock_settlement(
+            vm,
+            reference,
+            contract_address=vm._contract_address,
+            merchant=address(merchant),
+            amount=amount,
+        )
     vm.sender = sender
     return json.loads(contract.finalize_payment(request_id, reference))
 
@@ -220,17 +283,17 @@ def test_deployment_records_owner_agent_and_limits(guardian):
 
 def test_deployment_rejects_zero_agent(direct_vm, direct_deploy):
     with direct_vm.expect_revert("authorized_agent must not be the zero address"):
-        direct_deploy(CONTRACT, address(ZERO), PER_TX, HOURLY)
+        direct_deploy(CONTRACT, address(ZERO), PER_TX, HOURLY, VERIFIER_URL)
 
 
 def test_deployment_rejects_per_transaction_limit_above_hourly(direct_vm, direct_deploy):
     with direct_vm.expect_revert("per_transaction_limit must not exceed hourly_limit"):
-        direct_deploy(CONTRACT, address(AGENT), HOURLY + 1, HOURLY)
+        direct_deploy(CONTRACT, address(AGENT), HOURLY + 1, HOURLY, VERIFIER_URL)
 
 
 def test_deployment_rejects_zero_limits(direct_vm, direct_deploy):
     with direct_vm.expect_revert("per_transaction_limit must be greater than zero"):
-        direct_deploy(CONTRACT, address(AGENT), 0, HOURLY)
+        direct_deploy(CONTRACT, address(AGENT), 0, HOURLY, VERIFIER_URL)
 
 
 # --------------------------------------------------------------- adjudication
@@ -289,6 +352,7 @@ def test_non_numeric_risk_score_fails_the_transaction(direct_vm, guardian):
 
 def test_model_reply_wrapped_in_prose_is_still_parsed(direct_vm, guardian):
     direct_vm.clear_mocks()
+    mock_artifact_web(direct_vm)
     direct_vm.mock_llm(r".*", f"```json\n{json.dumps(APPROVE)}\n```")
     assert submit(guardian)["status"] == "APPROVED"
 
@@ -333,7 +397,7 @@ def test_amount_over_the_per_transaction_limit_is_rejected(direct_vm, guardian):
 
 def test_amount_over_the_treasury_balance_is_rejected(direct_vm, direct_deploy):
     direct_vm.sender = OWNER
-    contract = direct_deploy(CONTRACT, address(AGENT), PER_TX, HOURLY)
+    contract = direct_deploy(CONTRACT, address(AGENT), PER_TX, HOURLY, VERIFIER_URL)
     contract.set_merchant_allowed(address(MERCHANT), True)
     fund(direct_vm, AMOUNT // 2)
 
@@ -729,7 +793,7 @@ def test_limits_must_stay_internally_consistent(direct_vm, guardian):
 
 def test_withdrawal_requires_a_funded_treasury(direct_vm, direct_deploy):
     direct_vm.sender = OWNER
-    contract = direct_deploy(CONTRACT, address(AGENT), PER_TX, HOURLY)
+    contract = direct_deploy(CONTRACT, address(AGENT), PER_TX, HOURLY, VERIFIER_URL)
 
     with direct_vm.expect_revert("balance is insufficient"):
         contract.withdraw(address(OWNER), AMOUNT)
@@ -946,6 +1010,7 @@ def test_a_digest_committed_by_a_stranger_does_not_verify(direct_vm, guardian):
     direct_vm.sender = STRANGER
     guardian.commit_artifact(
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "https://artifacts.example/other",
         "some other deliverable",
     )
     direct_vm.sender = OWNER
@@ -962,15 +1027,56 @@ def test_a_digest_committed_by_a_stranger_does_not_verify(direct_vm, guardian):
     assert "committed on-chain" in result["reasoning"]
 
 
+def test_an_artifact_whose_contents_do_not_match_the_digest_is_not_verified(direct_vm, guardian):
+    """The validators fetch the committed URL themselves and hash the contents.
+    A body that does not hash to the committed digest cannot pass."""
+    direct_vm.clear_mocks()
+    mock_artifact_web(direct_vm, body="tampered invoice contents")
+    direct_vm.mock_llm(r".*", json.dumps(APPROVE))
+
+    result = submit(guardian)
+
+    assert result["status"] == "MANUAL_REVIEW"
+    assert result["decidedBy"] == "POLICY_OVERRIDE"
+    assert "could not be independently fetched" in result["reasoning"]
+
+
+def test_an_unreachable_artifact_url_is_not_verified(direct_vm, guardian):
+    """If the committed URL cannot be fetched, the artifact is not verified."""
+    direct_vm.clear_mocks()
+    direct_vm.mock_llm(r".*", json.dumps(APPROVE))
+
+    result = submit(guardian)
+
+    assert result["status"] == "MANUAL_REVIEW"
+    assert "could not be independently fetched" in result["reasoning"]
+
+
+def test_a_validator_must_agree_the_artifact_hashes_correctly(direct_vm, guardian):
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+
+    # The validator's own fetch returns a body that does not match the digest.
+    direct_vm.clear_mocks()
+    mock_artifact_web(direct_vm, body="different contents")
+    direct_vm.mock_llm(r".*", json.dumps(APPROVE))
+    assert direct_vm.run_validator() is False
+
+
 def test_commit_artifact_rejects_a_malformed_digest(direct_vm, guardian):
     with direct_vm.expect_revert("64-character sha256 hex"):
-        guardian.commit_artifact("not-a-digest", "invoice Q-1")
+        guardian.commit_artifact("not-a-digest", ARTIFACT_URL, "invoice Q-1")
+
+
+def test_commit_artifact_rejects_a_non_http_url(direct_vm, guardian):
+    with direct_vm.expect_revert("must be an http"):
+        guardian.commit_artifact(DIGEST_HEX, "ftp://example/artifact", "invoice Q-1")
 
 
 def test_an_artifact_cannot_be_reclaimed_by_another_account(direct_vm, guardian):
     direct_vm.sender = STRANGER
     with direct_vm.expect_revert("already committed by another account"):
-        guardian.commit_artifact(DIGEST_HEX, "claiming someone else's artifact")
+        guardian.commit_artifact(DIGEST_HEX, ARTIFACT_URL, "claiming someone else's artifact")
 
     # The merchant's commitment is untouched: an approval citing it still verifies.
     direct_vm.sender = OWNER
@@ -1011,29 +1117,87 @@ def test_an_unsettled_external_transfer_can_be_unwound(direct_vm, guardian):
     assert request_record(guardian)["status"] == "PAID"
 
 
-def test_only_the_owner_can_unwind_a_pending_payment(direct_vm, guardian):
+def test_anyone_can_unwind_a_pending_payment(direct_vm, guardian):
+    """Unwinding is permissionless bookkeeping: no funds move, so a stranger can
+    release the reservation and return the request to APPROVED."""
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
     approve_confirm_execute(direct_vm, guardian)
 
-    with direct_vm.expect_revert("only the owner"):
-        resolve_pending(direct_vm, guardian, sender=AGENT)
-    with direct_vm.expect_revert("only the owner"):
-        resolve_pending(direct_vm, guardian, sender=MERCHANT)
+    resolve_pending(direct_vm, guardian, sender=STRANGER)
+    assert request_record(guardian)["status"] == "APPROVED"
 
 
-def test_only_the_owner_can_finalize_a_payment(direct_vm, guardian):
-    """No signer of a PAYMENT_PENDING record can mark it paid on assertion
-    alone: settlement finalization is the owner's custody operation."""
+def test_anyone_can_finalize_once_the_transfer_is_verified(direct_vm, guardian):
+    """Finalization is permissionless, but it is bound to the finalized transfer:
+    the validators fetch the receipt and verify it. A stranger can settle only a
+    transfer that actually finalized with the right sender, recipient, and
+    amount."""
     mock_verdict(direct_vm, APPROVE)
     submit(guardian)
     approve_confirm_execute(direct_vm, guardian)
 
-    with direct_vm.expect_revert("only the owner"):
-        finalize_as(direct_vm, guardian, sender=MERCHANT)
-
-    finalize_as(direct_vm, guardian, sender=OWNER)
+    finalize_as(direct_vm, guardian, sender=STRANGER)
     assert request_record(guardian)["status"] == "PAID"
+
+
+def test_finalize_is_refused_when_the_receipt_amount_differs(direct_vm, guardian):
+    """A receipt that does not match the request does not settle it."""
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    approve_confirm_execute(direct_vm, guardian)
+
+    with direct_vm.expect_revert("could not be verified"):
+        finalize_as(
+            direct_vm,
+            guardian,
+            reference="0x" + "ab" * 32,
+            amount=AMOUNT + 1,
+        )
+    assert request_record(guardian)["status"] == "PAYMENT_PENDING"
+
+
+def test_finalize_is_refused_when_the_receipt_is_not_finalized(direct_vm, guardian):
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    approve_confirm_execute(direct_vm, guardian)
+
+    mock_settlement(
+        direct_vm,
+        "0x" + "ab" * 32,
+        contract_address=direct_vm._contract_address,
+        merchant=address(MERCHANT),
+        amount=AMOUNT,
+        status="ACCEPTED",
+    )
+    direct_vm.sender = OWNER
+    with direct_vm.expect_revert("could not be verified"):
+        guardian.finalize_payment("req-1", "0x" + "ab" * 32)
+    assert request_record(guardian)["status"] == "PAYMENT_PENDING"
+
+
+def test_finalize_is_refused_when_the_receipt_is_unreachable(direct_vm, guardian):
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    approve_confirm_execute(direct_vm, guardian)
+
+    with direct_vm.expect_revert("could not be verified"):
+        finalize_as(direct_vm, guardian, mock=False)
+    assert request_record(guardian)["status"] == "PAYMENT_PENDING"
+
+
+def test_finalize_is_refused_when_the_recipient_differs(direct_vm, guardian):
+    mock_verdict(direct_vm, APPROVE)
+    submit(guardian)
+    approve_confirm_execute(direct_vm, guardian)
+
+    with direct_vm.expect_revert("could not be verified"):
+        finalize_as(
+            direct_vm,
+            guardian,
+            merchant=OTHER_MERCHANT,
+        )
+    assert request_record(guardian)["status"] == "PAYMENT_PENDING"
 
 
 def test_finalize_rejects_a_free_form_settlement_reference(direct_vm, guardian):
