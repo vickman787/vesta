@@ -15,7 +15,11 @@ import {
   fetchNativeBalance,
   fetchRequests,
   injectedProvider,
+  loadStoredWrites,
   readClient,
+  reconcileStoredWrite,
+  saveStoredWrite,
+  updateStoredWrite,
   verifySettlementTransfer,
   write,
   writeClient,
@@ -86,6 +90,7 @@ export default function Dashboard() {
   const [reviewReason, setReviewReason] = useState('');
   const [deliveryRef, setDeliveryRef] = useState(`delivery=invoice INV-8821`);
   const [artifactDigest, setArtifactDigest] = useState(DIGEST_HEX);
+  const [artifactUrl, setArtifactUrl] = useState('https://artifacts.example/invoice-Q-8821');
   const [artifactRef, setArtifactRef] = useState('invoice Q-8821');
   const [pendingAuth, setPendingAuth] = useState<{
     requestId: string;
@@ -151,6 +156,44 @@ export default function Dashboard() {
     void loadTreasury();
   }, [loadTreasury]);
 
+  // Reconcile writes recorded before a reload: re-check their finality and
+  // refresh the canonical state, so a page refresh never loses or misreports an
+  // in-flight transaction.
+  useEffect(() => {
+    if (contractState !== 'online') return;
+    let cancelled = false;
+    const pending = loadStoredWrites(contractAddress).filter(
+      (item) => item.status === 'pending',
+    );
+    if (pending.length === 0) return;
+    (async () => {
+      const client = readClient();
+      let changed = false;
+      for (const entry of pending.slice(0, 5)) {
+        const updated = await reconcileStoredWrite(client, contractAddress, entry);
+        if (cancelled) return;
+        if (updated.status !== 'pending') {
+          updateStoredWrite(contractAddress, entry.hash, {
+            status: updated.status,
+            category: updated.category,
+          });
+          note(
+            `Reconciled ${entry.functionName}: ${updated.status} (${
+              updated.category ?? ''
+            })`.trim(),
+            updated.status === 'failed',
+            entry.hash,
+          );
+          changed = true;
+        }
+      }
+      if (changed && !cancelled) await loadTreasury();
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [contractState, contractAddress, loadTreasury, note]);
+
   async function connect() {
     const provider = injectedProvider();
     if (!provider) {
@@ -185,12 +228,17 @@ export default function Dashboard() {
   }
 
   /**
-   * Run a contract write and refresh state only once the transaction has
-   * FINALIZED with a successful execution. Nothing is reported as done at
-   * acceptance: `write` waits for finalization and re-checks the execution
-   * result before returning.
+   * Run a contract write, persist its hash, and only report success after the
+   * canonical state reads back. The hash is recorded before finalization, so a
+   * failed or undetermined write still has an explorer link.
    */
-  async function send(label: string, functionName: string, args: unknown[], value = 0n) {
+  async function send(
+    label: string,
+    functionName: string,
+    args: unknown[],
+    value = 0n,
+    requestId?: string,
+  ) {
     if (!account) {
       note('Connect a wallet first.', true);
       return false;
@@ -203,9 +251,34 @@ export default function Dashboard() {
     try {
       const client = writeClient(account as `0x${string}`);
       note(`${label}: submitted to consensus...`);
-      const outcome = await write(client, contractAddress, functionName, args, value);
-      note(`${label}: finalized and confirmed on-chain`, false, outcome.hash);
+      const outcome = await write(
+        client,
+        contractAddress,
+        functionName,
+        args,
+        value,
+        (hash) =>
+          saveStoredWrite(contractAddress, {
+            functionName,
+            hash,
+            requestId,
+            at: Date.now(),
+            status: 'pending',
+          }),
+      );
+      if (!outcome.ok) {
+        updateStoredWrite(contractAddress, outcome.hash, {
+          status: 'failed',
+          category: outcome.category,
+        });
+        note(`${label}: ${outcome.message}`, true, outcome.hash);
+        await loadTreasury();
+        return false;
+      }
+      updateStoredWrite(contractAddress, outcome.hash, { status: 'ok' });
+      // Only claim success after reading the canonical state back.
       await loadTreasury();
+      note(`${label}: finalized and read back from the contract`, false, outcome.hash);
       return true;
     } catch (error) {
       note(`${label}: ${message(error, 'failed')}`, true);
@@ -227,6 +300,7 @@ export default function Dashboard() {
   async function commitArtifact() {
     const ok = await send('Artifact commit', 'commit_artifact', [
       artifactDigest.trim(),
+      artifactUrl.trim(),
       artifactRef.trim(),
     ]);
     if (ok) setSelectedId(selected?.requestId ?? '');
@@ -234,6 +308,10 @@ export default function Dashboard() {
 
   async function authorizePaymentExecute() {
     if (!selected) return;
+    if (!account) {
+      note('Connect a wallet first.', true);
+      return;
+    }
     const client = writeClient(account as `0x${string}`);
     const rc = readClient();
     const snapshotRequest = await fetchRequests(rc, contractAddress, 100).then(
@@ -247,9 +325,31 @@ export default function Dashboard() {
     setBusy('Payment authorization');
     try {
       note('Payment authorization: submitted to consensus...');
-      const outcome = await write(client, contractAddress, 'execute_payment', [
-        selected.requestId,
-      ]);
+      const outcome = await write(
+        client,
+        contractAddress,
+        'execute_payment',
+        [selected.requestId],
+        0n,
+        (hash) =>
+          saveStoredWrite(contractAddress, {
+            functionName: 'execute_payment',
+            hash,
+            requestId: selected.requestId,
+            at: Date.now(),
+            status: 'pending',
+          }),
+      );
+      if (!outcome.ok) {
+        updateStoredWrite(contractAddress, outcome.hash, {
+          status: 'failed',
+          category: outcome.category,
+        });
+        note(`Payment authorization: ${outcome.message}`, true, outcome.hash);
+        await loadTreasury();
+        return;
+      }
+      updateStoredWrite(contractAddress, outcome.hash, { status: 'ok' });
       setPendingAuth({
         requestId: selected.requestId,
         hash: outcome.hash,
@@ -259,12 +359,12 @@ export default function Dashboard() {
           merchantBalance,
         },
       });
+      await loadTreasury();
       note(
-        'Payment authorized and finalized on-chain. It is PAYMENT_PENDING — nothing is paid yet. Finalize only after the transfer settles and reconciles.',
+        'Payment authorized and read back as PAYMENT_PENDING — nothing is paid yet. Finalize only after the transfer settles and reconciles.',
         false,
         outcome.hash,
       );
-      await loadTreasury();
     } catch (error) {
       note(`Payment authorization: ${message(error, 'failed')}`, true);
     } finally {
@@ -674,6 +774,10 @@ export default function Dashboard() {
               <label>
                 Digest (sha256 hex)
                 <input value={artifactDigest} onChange={(event) => setArtifactDigest(event.target.value)} />
+              </label>
+              <label>
+                Artifact URL (validators fetch this)
+                <input value={artifactUrl} onChange={(event) => setArtifactUrl(event.target.value)} />
               </label>
               <label>
                 Reference

@@ -22,6 +22,7 @@ import { createClient } from 'genlayer-js';
 import { studionet } from 'genlayer-js/chains';
 import { TransactionStatus, ExecutionResult } from 'genlayer-js/types';
 import type { GenLayerChain, GenLayerClient, TransactionHash } from 'genlayer-js/types';
+import type { ReceiptCategory } from './receipt-outcome';
 import { assessReceipt } from './receipt-outcome';
 
 /** The only network this app talks to. */
@@ -265,18 +266,21 @@ export async function fetchMerchantAllowed(
 
 // --------------------------------------------------------------------- writes
 
-export type WriteOutcome = { hash: TransactionHash; status: TransactionStatus };
+export type WriteResult =
+  | { ok: true; hash: TransactionHash; status: TransactionStatus }
+  | { ok: false; hash: TransactionHash; category: ReceiptCategory; message: string };
+
+const TERMINAL_WAIT_MS = 1500;
 
 /**
- * Send a write transaction and wait for it to FINALIZE, checking the execution
- * result before reporting anything as successful.
+ * Send a write transaction and wait for it to FINALIZE.
  *
- * Nothing here is reported as done at acceptance: a transaction is only
- * `FINALIZED` once the validator set has finished with it, and a finalize that
- * ended in `FINISHED_WITH_ERROR` or never reached a result is surfaced as an
- * error rather than success. Funding, adjudication, configuration changes, and
- * payment authorization all go through this same gate, so the UI never claims
- * a state change the chain has not confirmed.
+ * The transaction hash is surfaced immediately (through `onHash` and the
+ * returned result) so the caller can persist it and link to the explorer even
+ * when the write later fails. Success is only reported for a FINALIZED receipt
+ * with a successful execution; rollback, undetermined, appealed, no-status, and
+ * timeout outcomes are returned as failures with their category, never as
+ * success.
  */
 export async function write(
   client: Client,
@@ -284,30 +288,131 @@ export async function write(
   functionName: string,
   args: unknown[],
   value = 0n,
-): Promise<WriteOutcome> {
+  onHash?: (hash: TransactionHash) => void,
+): Promise<WriteResult> {
   const hash = await client.writeContract({
     address: address as `0x${string}`,
     functionName,
     args: args as never,
     value,
   });
+  onHash?.(hash);
 
-  const receipt = await client.waitForTransactionReceipt({
-    hash,
-    status: TransactionStatus.FINALIZED,
-    interval: 1500,
-    retries: 200,
-  });
-
-  const assessment = assessReceipt(receipt.statusName, receipt.txExecutionResultName);
-  if (!assessment.success) {
-    if (assessment.category === 'execution-error') {
-      throw new Error(await executionError(client, hash));
-    }
-    throw new Error(assessment.message);
+  let receipt;
+  try {
+    receipt = await client.waitForTransactionReceipt({
+      hash,
+      status: TransactionStatus.FINALIZED,
+      interval: TERMINAL_WAIT_MS,
+      retries: 200,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      hash,
+      category: 'inconclusive',
+      message:
+        error instanceof Error
+          ? error.message
+          : 'The transaction did not finalize within the wait window.',
+    };
   }
 
-  return { hash, status: TransactionStatus.FINALIZED };
+  const assessment = assessReceipt(receipt.statusName, receipt.txExecutionResultName);
+  if (assessment.success) {
+    return { ok: true, hash, status: TransactionStatus.FINALIZED };
+  }
+  if (assessment.category === 'execution-error') {
+    return {
+      ok: false,
+      hash,
+      category: assessment.category,
+      message: await executionError(client, hash),
+    };
+  }
+  return {
+    ok: false,
+    hash,
+    category: assessment.category,
+    message: assessment.message,
+  };
+}
+
+// ---------------------------------------------------------------- write ledger
+
+export type StoredWrite = {
+  functionName: string;
+  hash: string;
+  requestId?: string;
+  at: number;
+  status: 'pending' | 'ok' | 'failed';
+  category?: string;
+};
+
+const ledgerKey = (address: string) => `vesta.writes.${address.toLowerCase()}`;
+
+/** Persist a write so it survives a reload and can be reconciled later. */
+export function saveStoredWrite(address: string, entry: StoredWrite): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const existing = loadStoredWrites(address).filter((item) => item.hash !== entry.hash);
+    const next = [entry, ...existing].slice(0, 50);
+    window.localStorage.setItem(ledgerKey(address), JSON.stringify(next));
+  } catch {
+    // Storage is best-effort; losing the ledger must not break the write.
+  }
+}
+
+export function updateStoredWrite(
+  address: string,
+  hash: string,
+  patch: Partial<StoredWrite>,
+): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const items = loadStoredWrites(address).map((item) =>
+      item.hash === hash ? { ...item, ...patch } : item,
+    );
+    window.localStorage.setItem(ledgerKey(address), JSON.stringify(items));
+  } catch {
+    // ignore
+  }
+}
+
+export function loadStoredWrites(address: string): StoredWrite[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(ledgerKey(address));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as StoredWrite[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Re-check the status of a stored write, so a reload can reconcile it. */
+export async function reconcileStoredWrite(
+  client: Client,
+  address: string,
+  entry: StoredWrite,
+): Promise<StoredWrite> {
+  try {
+    const receipt = await client.waitForTransactionReceipt({
+      hash: entry.hash as TransactionHash,
+      status: TransactionStatus.FINALIZED,
+      interval: TERMINAL_WAIT_MS,
+      retries: 20,
+    });
+    const assessment = assessReceipt(receipt.statusName, receipt.txExecutionResultName);
+    return {
+      ...entry,
+      status: assessment.success ? 'ok' : 'failed',
+      category: assessment.category,
+    };
+  } catch {
+    return entry;
+  }
 }
 
 /** Read the contract's own error message out of the execution trace. */
